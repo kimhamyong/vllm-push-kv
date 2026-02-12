@@ -337,7 +337,10 @@ class NixlConnector(KVConnectorBase_V1):
             return False
 
         extra_config = self.kv_transfer_config.kv_connector_extra_config
-        return bool(str(extra_config.get("enable_cross_layers_blocks", "False")))
+        value = extra_config.get("enable_cross_layers_blocks", False)
+        if isinstance(value, str):
+            return value.lower() in ("true", "1", "yes")
+        return bool(value)
 
     def __init__(
         self,
@@ -2287,6 +2290,13 @@ class NixlConnectorWorker:
             # will be issued at the last model layer or in
             # wait_for_push_complete().
             if not self._is_all_layers_mode and current_layer_idx > 0:
+                logger.info(
+                    "CATCH-UP WRITE req=%s resolved_at_layer=%d "
+                    "catch_up_layers=0..%d",
+                    req_id,
+                    current_layer_idx,
+                    current_layer_idx - 1,
+                )
                 for missed_layer in range(current_layer_idx):
                     is_last = missed_layer == self.num_layers - 1
                     self._write_push_for_layer(
@@ -2324,7 +2334,7 @@ class NixlConnectorWorker:
             layer_idx=write_layer_idx,
         )
 
-        notif = None
+        notif = b""
         if is_last_layer:
             notif_id = target["notif_id"]
             notif = f"{notif_id}:{self.world_size}".encode()
@@ -2375,6 +2385,8 @@ class NixlConnectorWorker:
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
 
+    _last_save_kv_ts: float = 0.0
+
     def save_kv_layer(
         self,
         layer_name: str,
@@ -2383,6 +2395,11 @@ class NixlConnectorWorker:
     ) -> None:
         """Push mode: WRITE KV cache per-layer to Decode."""
         import re
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        _gap = (_t0 - self._last_save_kv_ts) * 1000 if self._last_save_kv_ts > 0 else -1.0
+        self._last_save_kv_ts = _t0
 
         # Map layer_name to model layer_idx
         layer_idx = self._layer_name_to_idx.get(layer_name)
@@ -2394,11 +2411,20 @@ class NixlConnectorWorker:
             else:
                 return
 
+        _had_pending = bool(self._pending_push_reqs)
         # Resolve any pending push requests that now have block info
         if self._pending_push_reqs:
             self._resolve_pending_pushes(layer_idx)
 
         if not self._push_targets:
+            logger.info(
+                "save_kv_layer layer=%d gap=%.3fms no_targets "
+                "had_pending=%s pending_left=%d",
+                layer_idx,
+                _gap,
+                _had_pending,
+                len(self._pending_push_reqs),
+            )
             return
 
         if self._is_all_layers_mode:
@@ -2420,6 +2446,15 @@ class NixlConnectorWorker:
         else:
             # Per-layer mode: WRITE each layer individually.
             is_last_layer = layer_idx == self.num_layers - 1
+            logger.info(
+                "save_kv_layer WRITE layer=%d/%d is_last=%s "
+                "gap=%.3fms targets=%d",
+                layer_idx,
+                self.num_layers - 1,
+                is_last_layer,
+                _gap,
+                len(self._push_targets),
+            )
             for req_id, target in self._push_targets.items():
                 self._write_push_for_layer(
                     req_id,
