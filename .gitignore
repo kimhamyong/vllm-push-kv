@@ -221,6 +221,9 @@ hip_compat.h
 # Benchmark dataset
 benchmarks/**/*.json
 
+# Benchmark results
+results/
+
 # Linting
 actionlint
 shellcheck*/

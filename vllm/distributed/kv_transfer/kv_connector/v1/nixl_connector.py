@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
@@ -84,6 +84,9 @@ ReqId = str
 NIXL_CONNECTOR_VERSION: int = 2
 
 GET_META_MSG = b"get_meta_msg"
+PUSH_BLOCK_INFO_MSG = b"push_block_info_msg"
+# Port offset for Worker-side push block info listener
+WORKER_PUSH_PORT_OFFSET = 100
 
 logger = init_logger(__name__)
 
@@ -251,13 +254,24 @@ class ReqMeta:
     remote: RemoteMeta | None = None
 
 
+@dataclass
+class PushReqMeta:
+    """Metadata for push (WRITE) KV transfer from prefill to decode."""
+    local_block_ids: list[int]
+    local_physical_block_ids: list[int]
+    decode_request_id: str  # Decode's request_id (key for block info lookup)
+
+
 class NixlConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
+        self.reqs_to_push: dict[ReqId, PushReqMeta] = {}
         self.reqs_to_send: dict[ReqId, float] = {}
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
+        # Push mode (Decode): vllm_req_id → proxy_req_id for notification
+        self.reqs_push_recv: dict[ReqId, str] = {}
 
     def _add_new_req(
         self,
@@ -296,6 +310,18 @@ class NixlConnectorMetadata(KVConnectorMetadata):
             port=kv_transfer_params["remote_port"],
         )
         self.reqs_to_recv[request_id] = req
+
+    def add_new_req_to_push(
+        self,
+        request_id: ReqId,
+        local_block_ids: list[int],
+        kv_transfer_params: dict[str, Any],
+    ):
+        self.reqs_to_push[request_id] = PushReqMeta(
+            local_block_ids=local_block_ids,
+            local_physical_block_ids=local_block_ids,
+            decode_request_id=kv_transfer_params["decode_request_id"],
+        )
 
 
 class NixlConnector(KVConnectorBase_V1):
@@ -468,8 +494,9 @@ class NixlConnector(KVConnectorBase_V1):
         self.connector_worker.start_load_kv(self._connector_metadata)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        """NixlConnector does not do layerwise saving."""
-        pass
+        """Push mode (Decode): wait for push notification before forward."""
+        assert self.connector_worker is not None
+        self.connector_worker.wait_for_push_recv()
 
     def save_kv_layer(
         self,
@@ -478,14 +505,19 @@ class NixlConnector(KVConnectorBase_V1):
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> None:
-        """NixlConnector does not save explicitly."""
-        pass
+        """Push mode: delegate per-layer WRITE to worker."""
+        assert self.connector_worker is not None
+        self.connector_worker.save_kv_layer(
+            layer_name, kv_layer, attn_metadata
+        )
 
     def wait_for_save(self):
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:
             self.connector_worker.save_kv_to_host(self._connector_metadata)
+        # Push mode: wait for all WRITE transfers to complete
+        self.connector_worker.wait_for_push_complete()
 
     def shutdown(self):
         if self.connector_worker is not None:
@@ -539,12 +571,58 @@ class NixlConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[ReqId, tuple[Request, list[int]]] = {}
         self._reqs_need_save: dict[ReqId, Request] = {}
+        # Push (WRITE) requests: prefill pushes KV per-layer to decode
+        self._reqs_need_push: dict[ReqId, Request] = {}
+        # Push mode (Decode): vllm_req_id → proxy_req_id
+        self._reqs_need_push_recv: dict[ReqId, str] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
         self._reqs_in_batch: set[ReqId] = set()
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
         self._reqs_not_processed: set[ReqId] = set()
+
+    def _send_push_block_info(
+        self,
+        prefill_host: str,
+        prefill_port: int,
+        block_info: dict,
+    ):
+        """Send block info to Prefill Worker's push listener ZMQ.
+
+        Called immediately from update_state_after_alloc() to minimize
+        latency (no need to wait for metadata→Worker pipeline).
+        """
+        # Target each Prefill TP rank's push listener
+        tp_size = self.vllm_config.parallel_config.tensor_parallel_size
+        for tp_rank in range(tp_size):
+            target_port = (
+                prefill_port + WORKER_PUSH_PORT_OFFSET + tp_rank
+            )
+            path = make_zmq_path("tcp", prefill_host, target_port)
+            logger.debug(
+                "Scheduler sending push block info to %s for req=%s",
+                path,
+                block_info["request_id"],
+            )
+            with zmq_ctx(zmq.REQ, path) as sock:
+                sock.setsockopt(zmq.RCVTIMEO, 5000)
+                msg = msgspec.msgpack.encode(
+                    (PUSH_BLOCK_INFO_MSG, block_info)
+                )
+                sock.send(msg)
+                try:
+                    reply = sock.recv()
+                    if reply != b"OK":
+                        logger.warning(
+                            "Push block info send got non-OK reply: %s",
+                            reply,
+                        )
+                except zmq.Again:
+                    logger.error(
+                        "Push block info send timed out for req=%s",
+                        block_info["request_id"],
+                    )
 
     def shutdown(self):
         self._stop_event.set()
@@ -679,6 +757,46 @@ class NixlConnectorScheduler:
         if not params:
             return
 
+        # Push mode (Prefill side): compute + WRITE KV per-layer to Decode
+        # Block IDs acquired later in build_connector_meta() via
+        # yield_req_data() to get the final, complete block list.
+        if params.get("do_push_kv") and params.get("do_remote_decode"):
+            self._reqs_in_batch.add(request.request_id)
+            self._reqs_need_push[request.request_id] = request
+            return
+
+        # Push mode (Decode side): allocate blocks → send info immediately
+        if params.get("push_mode") and params.get("do_remote_prefill"):
+            local_block_ids = (
+                blocks.get_unhashed_block_ids()
+                if num_external_tokens > 0
+                else []
+            )
+            block_info = {
+                "request_id": params["proxy_request_id"],
+                "engine_id": self.engine_id,
+                "block_ids": local_block_ids,
+                "host": self.side_channel_host,
+                "port": self.side_channel_port,
+                "tp_size": (
+                    self.vllm_config.parallel_config
+                    .tensor_parallel_size
+                ),
+            }
+            # Send block info to Prefill Worker ZMQ immediately
+            self._send_push_block_info(
+                params["prefill_zmq_host"],
+                params["prefill_zmq_port"],
+                block_info,
+            )
+            # Store proxy_req_id mapping for Worker notification matching
+            self._reqs_need_push_recv[request.request_id] = (
+                params["proxy_request_id"]
+            )
+            params["do_remote_prefill"] = False
+            return
+
+        # Pull mode (existing logic, unchanged)
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
         if self.use_host_buffer and params.get("do_remote_decode"):
@@ -763,12 +881,31 @@ class NixlConnectorScheduler:
                 # Therefore, only pop if `not is_partial`.
                 self._reqs_need_save.pop(req_id)
 
+        # Push mode (Prefill): get final block IDs from scheduler_output
+        # (same pattern as pull mode's _reqs_need_save above).
+        for req_id, new_block_id_groups, _ in yield_req_data(
+                scheduler_output):
+            req_to_push = self._reqs_need_push.get(req_id)
+            if req_to_push is None or new_block_id_groups is None:
+                continue
+            assert req_to_push.kv_transfer_params is not None
+            meta.add_new_req_to_push(
+                request_id=req_id,
+                local_block_ids=new_block_id_groups[0],
+                kv_transfer_params=req_to_push.kv_transfer_params,
+            )
+
+        # Push mode (Decode): proxy_req_id mapping for push recv
+        meta.reqs_push_recv = self._reqs_need_push_recv
+
         meta.reqs_to_send = self._reqs_need_send
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
 
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()
+        self._reqs_need_push.clear()
+        self._reqs_need_push_recv = {}
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
@@ -810,6 +947,14 @@ class NixlConnectorScheduler:
 
         if not params.get("do_remote_decode"):
             return False, None
+
+        # Push mode: blocks freed immediately (WRITEs done in save_kv_layer)
+        if params.get("do_push_kv"):
+            if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
+                self._reqs_not_processed.add(request.request_id)
+                self._reqs_need_push.pop(request.request_id, None)
+            return False, None
+
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             # Also include the case of a P/D Prefill request with immediate
             # block free (eg abort). Stop tracking this request.
@@ -1025,6 +1170,39 @@ class NixlConnectorWorker:
 
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
+        )
+
+        # Push mode state (Worker-side)
+        # Block info received from Decode via Worker ZMQ listener
+        self._worker_received_push_block_info: dict[str, dict] = {}
+        # Pending push requests waiting for block info or handshake
+        self._pending_push_reqs: dict[ReqId, PushReqMeta] = {}
+        # Resolved push targets: req_id -> target info
+        self._push_targets: dict[ReqId, dict[str, Any]] = {}
+        # In-progress WRITE transfer handles
+        self._sending_transfers = defaultdict[ReqId, list[TransferHandle]](
+            list)
+        # Push mode (Decode): requests waiting for push notification
+        self._push_recv_reqs: set[ReqId] = set()
+        # Push mode: completed push recv requests
+        self._push_done_recving: set[ReqId] = set()
+        # Push mode (Decode): proxy_request_id -> vllm_decode_request_id
+        self._push_proxy_to_local_req: dict[str, ReqId] = {}
+        # Worker push listener thread
+        self._push_listener_thread: threading.Thread | None = None
+        self._push_listener_stop_event = threading.Event()
+        # Side channel host/port for Worker push listener
+        self._side_channel_host = envs.VLLM_NIXL_SIDE_CHANNEL_HOST
+        self._side_channel_port = (
+            envs.VLLM_NIXL_SIDE_CHANNEL_PORT
+            + vllm_config.parallel_config.data_parallel_index
+        )
+        # Layer name to index mapping (lazy initialized)
+        self._layer_name_to_idx: dict[str, int] = {}
+        # ALL_LAYERS mode: KV cache is a single tensor for all layers
+        self._is_all_layers_mode = False
+        self._model_num_layers = (
+            vllm_config.model_config.get_total_num_hidden_layers()
         )
 
     def _nixl_handshake(
@@ -1284,6 +1462,102 @@ class NixlConnectorWorker:
 
         fut.add_done_callback(request_ready)
 
+    @staticmethod
+    def _push_block_info_listener(
+        ready_event: threading.Event,
+        stop_event: threading.Event,
+        host: str,
+        port: int,
+        received_push_block_info: dict[str, dict],
+        on_block_info_received: Callable[[dict], None],
+    ):
+        """Worker-side listener for push block info from Decode."""
+        path = make_zmq_path("tcp", host, port)
+        logger.debug("Starting push block info listener on: %s", path)
+        with zmq_ctx(zmq.ROUTER, path) as sock:
+            sock.setsockopt(zmq.RCVTIMEO, 1000)
+            ready_event.set()
+            while True:
+                try:
+                    identity, _, msg = sock.recv_multipart()
+                except zmq.Again:
+                    if stop_event.is_set():
+                        break
+                    continue
+                except Exception as e:
+                    logger.error(
+                        "Push listener recv error: %s", e)
+                    continue
+                try:
+                    msg_type, payload = msgspec.msgpack.decode(msg)
+                    if msg_type == PUSH_BLOCK_INFO_MSG:
+                        request_id = payload["request_id"]
+                        logger.info(
+                            "Push listener received block info "
+                            "for req=%s",
+                            request_id,
+                        )
+                        received_push_block_info[request_id] = payload
+                        on_block_info_received(payload)
+                        sock.send_multipart(
+                            (identity, b"", b"OK"))
+                    else:
+                        logger.warning(
+                            "Push listener got unexpected "
+                            "message type: %s",
+                            msg_type,
+                        )
+                        sock.send_multipart(
+                            (identity, b"", b"ERROR"))
+                except Exception as e:
+                    logger.error(
+                        "Push listener processing error: %s",
+                        e, exc_info=True)
+                    try:
+                        sock.send_multipart(
+                            (identity, b"", b"ERROR"))
+                    except Exception:
+                        pass
+
+    def _on_push_block_info_received(self, block_info: dict):
+        """Called from push listener thread when block info arrives.
+
+        Triggers background NIXL handshake with Decode engine so it's
+        ready by the time save_kv_layer() needs it.
+        """
+        engine_id = block_info["engine_id"]
+        with self._handshake_lock:
+            if engine_id in self._remote_agents:
+                return  # Already handshaken
+            if engine_id in self._handshake_futures:
+                return  # Already in progress
+
+            fut = self._handshake_initiation_executor.submit(
+                self._nixl_handshake,
+                host=block_info["host"],
+                port=block_info["port"],
+                remote_tp_size=block_info["tp_size"],
+                expected_engine_id=engine_id,
+            )
+            self._handshake_futures[engine_id] = fut
+
+            def done_callback(
+                f: Future[dict[int, str]], eid: str = engine_id
+            ):
+                with self._handshake_lock:
+                    del self._handshake_futures[eid]
+                    try:
+                        self._remote_agents[eid] = f.result()
+                    except Exception as e:
+                        self._log_failure(
+                            failure_type="push_handshake_failed",
+                            req_id=None,
+                            error=e,
+                            remote_engine_id=eid,
+                        )
+
+            fut.add_done_callback(done_callback)
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
@@ -1402,6 +1676,18 @@ class NixlConnectorWorker:
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
         self.num_regions = len(caches_data)
         self.num_layers = len(xfer_buffers.keys())
+        self._is_all_layers_mode = (
+            self.num_layers == 1
+            and self._model_num_layers > 1
+        )
+        logger.debug(
+            "KV cache registration: num_layers=%d, num_regions=%d, "
+            "is_all_layers_mode=%s, model_num_layers=%d",
+            self.num_layers,
+            self.num_regions,
+            self._is_all_layers_mode,
+            self._model_num_layers,
+        )
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
         logger.debug("Registering descs: %s", caches_data)
@@ -1472,6 +1758,32 @@ class NixlConnectorWorker:
         self.xfer_handshake_metadata = NixlHandshakePayload(
             compatibility_hash=self.compat_hash,
             agent_metadata_bytes=encoder.encode(agent_metadata),
+        )
+
+        # Start Worker push listener for receiving block info from Decode
+        ready_event = threading.Event()
+        worker_push_port = (
+            self._side_channel_port
+            + WORKER_PUSH_PORT_OFFSET
+            + self.tp_rank
+        )
+        self._push_listener_thread = threading.Thread(
+            target=self._push_block_info_listener,
+            args=(
+                ready_event,
+                self._push_listener_stop_event,
+                self._side_channel_host,
+                worker_push_port,
+                self._worker_received_push_block_info,
+                self._on_push_block_info_received,
+            ),
+            daemon=True,
+            name="nixl_worker_push_listener",
+        )
+        self._push_listener_thread.start()
+        ready_event.wait()
+        logger.info(
+            "Worker push listener started on port %d", worker_push_port
         )
 
     def register_local_xfer_handler(
@@ -1910,6 +2222,334 @@ class NixlConnectorWorker:
                             cache, indices, block_size_ratio
                         )
 
+    def _resolve_pending_pushes(self, current_layer_idx: int) -> None:
+        """Resolve pending push requests that now have block info + handshake.
+
+        Called at the top of save_kv_layer(). For requests resolved
+        mid-forward, issues catch-up WRITEs for layers 0..current-1.
+        """
+        resolved = []
+        for req_id, push_meta in self._pending_push_reqs.items():
+            block_info = self._worker_received_push_block_info.get(
+                push_meta.decode_request_id
+            )
+            if block_info is None:
+                continue  # Block info not yet arrived
+
+            target_engine_id = block_info["engine_id"]
+            # Check handshake status
+            with self._handshake_lock:
+                if target_engine_id not in self._remote_agents:
+                    if target_engine_id not in self._handshake_futures:
+                        self._on_push_block_info_received(block_info)
+                    continue  # Handshake still in progress
+
+            remote_block_ids = self._logical_to_kernel_block_ids(
+                block_info["block_ids"]
+            )
+            local_block_ids = push_meta.local_physical_block_ids
+
+            # Align block counts to handle prefix cache hits and
+            # extra-block allocation mismatches.
+            # Mirrors pull mode's _read_blocks() trimming (line ~2958).
+            num_local = len(local_block_ids)
+            num_remote = len(remote_block_ids)
+            if num_local < num_remote:
+                # Decode allocated more blocks than Prefill (e.g., extra
+                # block for decode token). Trim remote tail.
+                logger.debug(
+                    "Push block trim remote: req=%s local=%d remote=%d",
+                    req_id, num_local, num_remote,
+                )
+                remote_block_ids = remote_block_ids[:num_local]
+            elif num_local > num_remote:
+                # Partial prefix cache hit on Decode: Decode already has
+                # cached blocks for the prefix and only reports unhashed
+                # (new) blocks. Trim local to keep only the tail blocks
+                # that correspond to the non-cached portion.
+                logger.debug(
+                    "Push block trim local: req=%s local=%d remote=%d",
+                    req_id, num_local, num_remote,
+                )
+                local_block_ids = local_block_ids[-num_remote:]
+
+            target = {
+                "engine_id": target_engine_id,
+                "local_block_ids": local_block_ids,
+                "remote_block_ids": remote_block_ids,
+                "notif_id": push_meta.decode_request_id,
+            }
+            self._push_targets[req_id] = target
+            resolved.append(req_id)
+
+            # Catch-up WRITE for layers already computed before resolution.
+            # In ALL_LAYERS mode, no per-layer catch-up needed — bulk WRITE
+            # will be issued at the last model layer or in
+            # wait_for_push_complete().
+            if not self._is_all_layers_mode and current_layer_idx > 0:
+                for missed_layer in range(current_layer_idx):
+                    is_last = missed_layer == self.num_layers - 1
+                    self._write_push_for_layer(
+                        req_id,
+                        target,
+                        write_layer_idx=missed_layer,
+                        layer_idx=missed_layer,
+                        is_last_layer=is_last,
+                    )
+
+        for req_id in resolved:
+            del self._pending_push_reqs[req_id]
+
+    def _write_push_for_layer(
+        self,
+        req_id: ReqId,
+        target: dict[str, Any],
+        write_layer_idx: int | None,
+        layer_idx: int,
+        is_last_layer: bool,
+    ) -> None:
+        """Issue a single WRITE transfer for one layer."""
+        target_engine_id = target["engine_id"]
+        local_block_ids = target["local_block_ids"]
+        remote_block_ids = target["remote_block_ids"]
+
+        local_descs = self._get_block_descs_ids(
+            self.engine_id,
+            local_block_ids,
+            layer_idx=write_layer_idx,
+        )
+        remote_descs = self._get_block_descs_ids(
+            target_engine_id,
+            remote_block_ids,
+            layer_idx=write_layer_idx,
+        )
+
+        notif = None
+        if is_last_layer:
+            notif_id = target["notif_id"]
+            notif = f"{notif_id}:{self.world_size}".encode()
+
+        local_handle = self.src_xfer_handles_by_block_size[
+            self.block_size
+        ]
+        remote_handle = self.dst_xfer_side_handles[target_engine_id][
+            self.tp_rank
+        ]
+
+        logger.info(
+            "WRITE prep req=%s layer_idx=%s local_blocks=%s(%d) "
+            "remote_blocks=%s(%d) local_descs=%s remote_descs=%s "
+            "notif=%s num_layers=%d num_regions=%d",
+            req_id, write_layer_idx,
+            local_block_ids, len(local_block_ids),
+            remote_block_ids, len(remote_block_ids),
+            local_descs.shape, remote_descs.shape,
+            notif, self.num_layers, self.num_regions,
+        )
+
+        handle = None
+        try:
+            handle = self.nixl_wrapper.make_prepped_xfer(
+                "WRITE",
+                local_handle,
+                local_descs,
+                remote_handle,
+                remote_descs,
+                notif_msg=notif,
+            )
+            self.nixl_wrapper.transfer(handle)
+            self._sending_transfers[req_id].append(handle)
+            logger.info(
+                "WRITE issued req=%s layer=%s is_last=%s",
+                req_id,
+                write_layer_idx,
+                is_last_layer,
+            )
+        except Exception as e:
+            logger.error(
+                "WRITE failed req=%s layer=%s: %s",
+                req_id,
+                write_layer_idx,
+                e,
+            )
+            if handle is not None:
+                self.nixl_wrapper.release_xfer_handle(handle)
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_cache: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+    ) -> None:
+        """Push mode: WRITE KV cache per-layer to Decode."""
+        import re
+
+        # Map layer_name to model layer_idx
+        layer_idx = self._layer_name_to_idx.get(layer_name)
+        if layer_idx is None:
+            match = re.search(r"layers\.(\d+)", layer_name)
+            if match:
+                layer_idx = int(match.group(1))
+                self._layer_name_to_idx[layer_name] = layer_idx
+            else:
+                return
+
+        # Resolve any pending push requests that now have block info
+        if self._pending_push_reqs:
+            self._resolve_pending_pushes(layer_idx)
+
+        if not self._push_targets:
+            return
+
+        if self._is_all_layers_mode:
+            # ALL_LAYERS: single KV tensor for all model layers.
+            # Only issue bulk WRITE at the last model layer.
+            is_last_model_layer = (
+                layer_idx == self._model_num_layers - 1
+            )
+            if not is_last_model_layer:
+                return
+            for req_id, target in self._push_targets.items():
+                self._write_push_for_layer(
+                    req_id,
+                    target,
+                    write_layer_idx=None,
+                    layer_idx=0,
+                    is_last_layer=True,
+                )
+        else:
+            # Per-layer mode: WRITE each layer individually.
+            is_last_layer = layer_idx == self.num_layers - 1
+            for req_id, target in self._push_targets.items():
+                self._write_push_for_layer(
+                    req_id,
+                    target,
+                    write_layer_idx=layer_idx,
+                    layer_idx=layer_idx,
+                    is_last_layer=is_last_layer,
+                )
+
+    def wait_for_push_recv(self) -> None:
+        """Block until all push recv requests have received notification.
+
+        Called from wait_for_layer_load on Decode side. In push mode,
+        Decode must wait for Prefill's WRITE to complete before the
+        forward pass can use the KV data.
+        """
+        if not self._push_recv_reqs:
+            return
+
+        timeout_s = 60.0
+        start = time.perf_counter()
+        while self._push_recv_reqs:
+            # _get_new_notifs handles push notifications internally,
+            # moving them to _push_done_recving
+            self._get_new_notifs()
+            if not self._push_recv_reqs:
+                break
+            if time.perf_counter() - start > timeout_s:
+                logger.error(
+                    "Push recv timeout after %.1fs, "
+                    "%d requests still pending",
+                    timeout_s,
+                    len(self._push_recv_reqs),
+                )
+                # Move remaining to done to unblock forward pass
+                self._push_done_recving.update(self._push_recv_reqs)
+                self._push_recv_reqs.clear()
+                break
+            time.sleep(0.001)
+
+    def wait_for_push_complete(self) -> None:
+        """Wait for all push WRITE transfers to complete.
+
+        Includes fallback: if _pending_push_reqs remain (block info
+        arrived after forward completed), wait for resolution then
+        issue bulk WRITE for all layers.
+        """
+        # Fallback: resolve any pending push reqs whose block info
+        # arrived after forward completed
+        if self._pending_push_reqs:
+            timeout_s = 30.0
+            start = time.perf_counter()
+            newly_resolved = []
+            while self._pending_push_reqs:
+                prev_targets = set(self._push_targets.keys())
+                self._resolve_pending_pushes(self.num_layers)
+                newly_resolved.extend(
+                    set(self._push_targets.keys()) - prev_targets
+                )
+                if not self._pending_push_reqs:
+                    logger.debug(
+                        "wait_for_push_complete: resolved %d pending "
+                        "push requests (bulk WRITE fallback) in %.1fms",
+                        len(newly_resolved),
+                        (time.perf_counter() - start) * 1000,
+                    )
+                    break
+                elapsed = time.perf_counter() - start
+                if elapsed > timeout_s:
+                    logger.error(
+                        "wait_for_push_complete: push resolve timeout "
+                        "after %.1fs, %d requests still pending",
+                        elapsed,
+                        len(self._pending_push_reqs),
+                    )
+                    break
+                time.sleep(0.005)
+
+            # Issue bulk WRITE for requests resolved in this fallback.
+            # For ALL_LAYERS mode, _resolve_pending_pushes skips catch-up
+            # so we must issue the WRITE here. For per-layer mode,
+            # catch-up already covered layers 0..num_layers-1, so this
+            # is a no-op (only needed if _resolve was called with
+            # current_layer_idx < num_layers, which doesn't happen here).
+            for req_id in newly_resolved:
+                target = self._push_targets.get(req_id)
+                if target is None:
+                    continue
+                if self._is_all_layers_mode:
+                    self._write_push_for_layer(
+                        req_id,
+                        target,
+                        write_layer_idx=None,
+                        layer_idx=0,
+                        is_last_layer=True,
+                    )
+
+        if not self._sending_transfers:
+            # Clean up push state
+            self._push_targets.clear()
+            self._pending_push_reqs.clear()
+            return
+
+        timeout_s = 30.0
+        start = time.perf_counter()
+        while self._sending_transfers:
+            done_reqs = self._pop_done_transfers(
+                self._sending_transfers
+            )
+            if done_reqs:
+                logger.debug(
+                    "Push WRITE completed for %d requests: %s",
+                    len(done_reqs),
+                    done_reqs,
+                )
+            if time.perf_counter() - start > timeout_s:
+                logger.error(
+                    "Push WRITE timeout after %.1fs, "
+                    "%d requests still pending",
+                    timeout_s,
+                    len(self._sending_transfers),
+                )
+                break
+            if self._sending_transfers:
+                time.sleep(0.001)
+
+        # Clean up push state for completed requests
+        self._push_targets.clear()
+        self._pending_push_reqs.clear()
+
     def get_finished(self) -> tuple[set[str], set[str]]:
         """
         Get requests that are done sending or recving on this specific worker.
@@ -1978,6 +2618,11 @@ class NixlConnectorWorker:
             del self._reqs_to_send[req_id]
             done_sending.add(req_id)
 
+        # Push mode (Decode): add push-done recv requests
+        if self._push_done_recving:
+            done_recving.update(self._push_done_recving)
+            self._push_done_recving.clear()
+
         return done_sending, done_recving
 
     def _get_new_notifs(self) -> set[str]:
@@ -1985,12 +2630,32 @@ class NixlConnectorWorker:
         Get req_ids which got a remote xfer message. When multiple consumers
         are reading from the same producer (heterogeneous TP scenario), wait
         for all consumers to be done pulling.
+
+        Also handles push mode notifications: when a push notification
+        arrives (matched via _push_proxy_to_local_req), it's accumulated
+        in _push_done_recving for get_finished() to pick up.
         """
         assert self.kv_topo is not None
         notified_req_ids: set[str] = set()
         for notifs in self.nixl_wrapper.get_new_notifs().values():
             for notif in notifs:
                 req_id, tp_size = notif.decode("utf-8").rsplit(":", 1)
+
+                # Push mode: check if this is a push WRITE notification
+                local_req_id = self._push_proxy_to_local_req.get(req_id)
+                if local_req_id is not None:
+                    self._push_recv_reqs.discard(local_req_id)
+                    self._push_done_recving.add(local_req_id)
+                    del self._push_proxy_to_local_req[req_id]
+                    logger.debug(
+                        "Push notification received for req=%s "
+                        "(proxy_id=%s)",
+                        local_req_id,
+                        req_id,
+                    )
+                    continue
+
+                # Pull mode: existing logic
                 if (
                     req_id not in self._reqs_to_send
                     and req_id not in self._reqs_to_process
@@ -2092,6 +2757,29 @@ class NixlConnectorWorker:
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+
+        # Push mode (Prefill side): store as pending for lazy resolution
+        for req_id, push_meta in metadata.reqs_to_push.items():
+            push_meta.local_physical_block_ids = (
+                self._logical_to_kernel_block_ids(
+                    push_meta.local_block_ids
+                )
+            )
+            self._pending_push_reqs[req_id] = push_meta
+            logger.debug(
+                "start_load_kv: push request %s stored as pending "
+                "(decode_req_id=%s, %d blocks)",
+                req_id,
+                push_meta.decode_request_id,
+                len(push_meta.local_physical_block_ids),
+            )
+
+        # Push mode (Decode side): track requests waiting for push notif
+        # and set up proxy_request_id → vllm_request_id mapping
+        for req_id, proxy_req_id in metadata.reqs_push_recv.items():
+            self._push_proxy_to_local_req[proxy_req_id] = req_id
+            self._push_recv_reqs.add(req_id)
+
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -2481,6 +3169,17 @@ class NixlConnectorWorker:
 
     def shutdown(self):
         """Shutdown the connector worker."""
+        # Stop push listener thread
+        self._push_listener_stop_event.set()
+        if self._push_listener_thread is not None:
+            self._push_listener_thread.join(timeout=3)
+
+        # Clean up push WRITE transfer handles
+        for handles in self._sending_transfers.values():
+            for handle in handles:
+                self.nixl_wrapper.release_xfer_handle(handle)
+        self._sending_transfers.clear()
+
         self._handshake_initiation_executor.shutdown(wait=False)
         for handles in self._recving_transfers.values():
             for handle in handles:

@@ -94,6 +94,7 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.clear_connector_metadata()
         return output
 
+
     def no_forward(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
         if self._disabled:
             return EMPTY_MODEL_RUNNER_OUTPUT
