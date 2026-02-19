@@ -337,7 +337,7 @@ class NixlConnector(KVConnectorBase_V1):
             return False
 
         extra_config = self.kv_transfer_config.kv_connector_extra_config
-        value = extra_config.get("enable_cross_layers_blocks", False)
+        value = extra_config.get("enable_cross_layers_blocks", "False")
         if isinstance(value, str):
             return value.lower() in ("true", "1", "yes")
         return bool(value)
@@ -394,6 +394,12 @@ class NixlConnector(KVConnectorBase_V1):
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         assert self.connector_scheduler is not None
+        logger.info(
+            "TRACE get_num_new_matched_tokens CALLED: req=%s, "
+            "computed=%s, params=%s",
+            request.request_id, num_computed_tokens,
+            request.kv_transfer_params,
+        )
         return self.connector_scheduler.get_num_new_matched_tokens(
             request, num_computed_tokens
         )
@@ -401,6 +407,12 @@ class NixlConnector(KVConnectorBase_V1):
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
+        logger.info(
+            "TRACE update_state_after_alloc CALLED: req=%s, "
+            "ext_tokens=%s, params=%s",
+            request.request_id, num_external_tokens,
+            request.kv_transfer_params,
+        )
         assert self.connector_scheduler is not None
         return self.connector_scheduler.update_state_after_alloc(
             request, blocks, num_external_tokens
@@ -900,6 +912,11 @@ class NixlConnectorScheduler:
 
         # Push mode (Decode): proxy_req_id mapping for push recv
         meta.reqs_push_recv = self._reqs_need_push_recv
+        if self._reqs_need_push_recv:
+            logger.info(
+                "TRACE build_connector_meta: reqs_push_recv=%s",
+                self._reqs_need_push_recv,
+            )
 
         meta.reqs_to_send = self._reqs_need_send
         meta.reqs_in_batch = self._reqs_in_batch
@@ -1185,6 +1202,13 @@ class NixlConnectorWorker:
         # In-progress WRITE transfer handles
         self._sending_transfers = defaultdict[ReqId, list[TransferHandle]](
             list)
+        # Background flush transfers (SENT → DONE): handles moved here
+        # when async ACK is enabled and GPU was released at SENT state.
+        self._background_transfers: dict[ReqId, list[TransferHandle]] = {}
+        # Async ACK (default): return at SENT state, flush in background.
+        # Set VLLM_PUSH_SYNC_ACK=1 to block until DONE (TCP ACK).
+        self._push_async_ack = os.environ.get(
+            "VLLM_PUSH_SYNC_ACK", "0") != "1"
         # Push mode (Decode): requests waiting for push notification
         self._push_recv_reqs: set[ReqId] = set()
         # Push mode: completed push recv requests
@@ -1683,13 +1707,17 @@ class NixlConnectorWorker:
             self.num_layers == 1
             and self._model_num_layers > 1
         )
-        logger.debug(
-            "KV cache registration: num_layers=%d, num_regions=%d, "
-            "is_all_layers_mode=%s, model_num_layers=%d",
+        logger.info(
+            "DIAG KV cache registration: num_layers=%d, num_regions=%d, "
+            "num_blocks=%d, is_all_layers_mode=%s, model_num_layers=%d, "
+            "block_len_per_layer=%s, base_addrs=%s",
             self.num_layers,
             self.num_regions,
+            self.num_blocks,
             self._is_all_layers_mode,
             self._model_num_layers,
+            self.block_len_per_layer[:4],
+            [hex(a) for a in seen_base_addresses[:4]],
         )
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
@@ -1832,12 +1860,20 @@ class NixlConnectorWorker:
                     # Register addresses for V cache (K registered first).
                     v_addr = addr + kv_block_len
                     blocks_data.append((v_addr, kv_block_len, self.device_id))
-        logger.debug(
-            "Created %s blocks for src engine %s and rank %s on device id %s",
+        logger.info(
+            "DIAG register_local_xfer_handler: %d total descs for "
+            "engine=%s, rank=%d, device=%d, block_size=%d, "
+            "first3=[(0x%x,%d), (0x%x,%d), (0x%x,%d)]",
             len(blocks_data),
             self.engine_id,
             self.tp_rank,
             self.device_id,
+            block_size,
+            blocks_data[0][0], blocks_data[0][1],
+            blocks_data[1][0] if len(blocks_data) > 1 else 0,
+            blocks_data[1][1] if len(blocks_data) > 1 else 0,
+            blocks_data[2][0] if len(blocks_data) > 2 else 0,
+            blocks_data[2][1] if len(blocks_data) > 2 else 0,
         )
 
         descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
@@ -2014,12 +2050,22 @@ class NixlConnectorWorker:
                         (v_addr, local_block_len, nixl_agent_meta.device_id)
                     )
 
-        logger.debug(
-            "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
+        logger.info(
+            "DIAG add_remote_agent: %d total descs for "
+            "engine=%s, remote_rank=%d, local_rank=%d, "
+            "remote_num_blocks=%d, remote_block_lens=%s, "
+            "first3=[(0x%x,%d), (0x%x,%d), (0x%x,%d)]",
             len(blocks_data),
             engine_id,
             remote_tp_rank,
             self.tp_rank,
+            nixl_agent_meta.num_blocks,
+            nixl_agent_meta.block_lens[:4],
+            blocks_data[0][0], blocks_data[0][1],
+            blocks_data[1][0] if len(blocks_data) > 1 else 0,
+            blocks_data[1][1] if len(blocks_data) > 1 else 0,
+            blocks_data[2][0] if len(blocks_data) > 2 else 0,
+            blocks_data[2][1] if len(blocks_data) > 2 else 0,
         )
 
         # Register with NIXL.
@@ -2397,6 +2443,10 @@ class NixlConnectorWorker:
         import re
         import time as _time
 
+        # Poll background flush handles from previous async ACK requests.
+        # Completed handles (DONE) are released; still-pending ones remain.
+        self._drain_background_pushes()
+
         _t0 = _time.perf_counter()
         _gap = (_t0 - self._last_save_kv_ts) * 1000 if self._last_save_kv_ts > 0 else -1.0
         self._last_save_kv_ts = _t0
@@ -2558,28 +2608,74 @@ class NixlConnectorWorker:
             self._pending_push_reqs.clear()
             return
 
-        timeout_s = 30.0
-        start = time.perf_counter()
-        while self._sending_transfers:
-            done_reqs = self._pop_done_transfers(
-                self._sending_transfers
+        _t_start = time.perf_counter()
+
+        if self._push_async_ack:
+            # Async ACK mode: wait for SENT (data copied to CPU buffer),
+            # release GPU blocks, move flush handles to background.
+            timeout_s = 30.0
+            start = time.perf_counter()
+            while self._sending_transfers:
+                sent_reqs, bg_handles = self._pop_sent_transfers(
+                    self._sending_transfers
+                )
+                if sent_reqs:
+                    logger.debug(
+                        "Push WRITE SENT for %d requests: %s",
+                        len(sent_reqs),
+                        sent_reqs,
+                    )
+                # Move flush handles to background
+                for req_id, handles in bg_handles.items():
+                    self._background_transfers[req_id] = handles
+                if time.perf_counter() - start > timeout_s:
+                    logger.error(
+                        "Push WRITE SENT timeout after %.1fs, "
+                        "%d requests still pending",
+                        timeout_s,
+                        len(self._sending_transfers),
+                    )
+                    break
+                if self._sending_transfers:
+                    time.sleep(0.001)
+
+            _elapsed_ms = (time.perf_counter() - _t_start) * 1000
+            logger.info(
+                "wait_for_push_complete (async ACK): SENT in %.3fms, "
+                "%d handles moved to background",
+                _elapsed_ms,
+                sum(len(h) for h in self._background_transfers.values()),
             )
-            if done_reqs:
-                logger.debug(
-                    "Push WRITE completed for %d requests: %s",
-                    len(done_reqs),
-                    done_reqs,
+        else:
+            # Sync mode: block until all WRITE transfers reach DONE.
+            timeout_s = 30.0
+            start = time.perf_counter()
+            while self._sending_transfers:
+                done_reqs = self._pop_done_transfers(
+                    self._sending_transfers
                 )
-            if time.perf_counter() - start > timeout_s:
-                logger.error(
-                    "Push WRITE timeout after %.1fs, "
-                    "%d requests still pending",
-                    timeout_s,
-                    len(self._sending_transfers),
-                )
-                break
-            if self._sending_transfers:
-                time.sleep(0.001)
+                if done_reqs:
+                    logger.debug(
+                        "Push WRITE completed for %d requests: %s",
+                        len(done_reqs),
+                        done_reqs,
+                    )
+                if time.perf_counter() - start > timeout_s:
+                    logger.error(
+                        "Push WRITE timeout after %.1fs, "
+                        "%d requests still pending",
+                        timeout_s,
+                        len(self._sending_transfers),
+                    )
+                    break
+                if self._sending_transfers:
+                    time.sleep(0.001)
+
+            _elapsed_ms = (time.perf_counter() - _t_start) * 1000
+            logger.info(
+                "wait_for_push_complete (sync): DONE in %.3fms",
+                _elapsed_ms,
+            )
 
         # Clean up push state for completed requests
         self._push_targets.clear()
@@ -2614,6 +2710,42 @@ class NixlConnectorWorker:
             meta = self._recving_metadata.pop(req_id, None)
             assert meta is not None, f"{req_id} not found in recving_metadata list"
             assert meta.remote is not None
+
+            # DIAG: verify KV data after transfer
+            if self.device_kv_caches and meta.local_physical_block_ids:
+                try:
+                    import torch
+                    first_blk = meta.local_physical_block_ids[0]
+                    first_layer_name = next(iter(self.device_kv_caches))
+                    kv_tensor = self.device_kv_caches[first_layer_name]
+                    # Check a few values from the first block
+                    if hasattr(kv_tensor, 'shape') and len(kv_tensor.shape) >= 2:
+                        # For split K/V (5D tensor [2, N, H, S, D]):
+                        # block data is at kv_tensor[0, first_blk, ...]
+                        # For cross-layer: different layout
+                        if len(kv_tensor.shape) == 5:
+                            blk_data = kv_tensor[0, first_blk].flatten()[:20]
+                        elif len(kv_tensor.shape) == 4:
+                            blk_data = kv_tensor[first_blk].flatten()[:20]
+                        else:
+                            blk_data = kv_tensor.flatten()[:20]
+                        nonzero = torch.count_nonzero(blk_data).item()
+                        logger.info(
+                            "DIAG get_finished req=%s: "
+                            "local_block_ids=%s, first_blk=%d, "
+                            "tensor_shape=%s, "
+                            "first20_nonzero=%d/20, "
+                            "first5_vals=%s",
+                            req_id,
+                            meta.local_physical_block_ids[:5],
+                            first_blk,
+                            kv_tensor.shape,
+                            nonzero,
+                            blk_data[:5].tolist(),
+                        )
+                except Exception as diag_e:
+                    logger.info("DIAG get_finished error: %s", diag_e)
+
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
 
@@ -2744,7 +2876,7 @@ class NixlConnectorWorker:
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
                         self.nixl_wrapper.release_xfer_handle(handle)
-                    elif xfer_state == "PROC":
+                    elif xfer_state in ("PROC", "SENT"):
                         in_progress.append(handle)
                         continue
                     else:
@@ -2771,6 +2903,94 @@ class NixlConnectorWorker:
             else:
                 transfers[req_id] = in_progress
         return done_req_ids
+
+    def _pop_sent_transfers(
+        self, transfers: dict[str, list[int]]
+    ) -> tuple[set[str], dict[str, list[int]]]:
+        """
+        Pop xfers that have reached SENT state (data copied to CPU,
+        GPU can be released). Handles not yet DONE are returned for
+        background flush polling.
+        Returns:
+            (sent_req_ids, bg_handles) where bg_handles maps req_id
+            to handles that still need to reach DONE.
+        """
+        sent_req_ids: set[str] = set()
+        bg_handles: dict[str, list[int]] = {}
+        for req_id, handles in list(transfers.items()):
+            still_proc = []
+            flush_pending = []
+            for handle in handles:
+                try:
+                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
+                    if xfer_state == "DONE":
+                        res = self.nixl_wrapper.get_xfer_telemetry(handle)
+                        self.xfer_stats.record_transfer(res)
+                        self.nixl_wrapper.release_xfer_handle(handle)
+                    elif xfer_state == "SENT":
+                        # Data in CPU buffer, GPU can be freed
+                        flush_pending.append(handle)
+                    elif xfer_state == "PROC":
+                        still_proc.append(handle)
+                        continue
+                    else:
+                        self._log_failure(
+                            failure_type="transfer_failed",
+                            msg="Marking blocks as invalid",
+                            req_id=req_id,
+                            xfer_state=xfer_state,
+                        )
+                        self._handle_failed_transfer(req_id, handle)
+                except Exception as e:
+                    self._log_failure(
+                        failure_type="transfer_exception",
+                        msg="Marking blocks as invalid",
+                        req_id=req_id,
+                        error=e,
+                    )
+                    self._handle_failed_transfer(req_id, handle)
+
+            if still_proc:
+                # Some handles still in PROC - keep polling
+                transfers[req_id] = still_proc + flush_pending
+            else:
+                # All data sent (SENT or DONE)
+                sent_req_ids.add(req_id)
+                del transfers[req_id]
+                if flush_pending:
+                    bg_handles[req_id] = flush_pending
+        return sent_req_ids, bg_handles
+
+    def _drain_background_pushes(self) -> None:
+        """Lazy poll background flush handles (SENT → DONE).
+        Called at the beginning of save_kv_layer() for cleanup."""
+        if not self._background_transfers:
+            return
+        for req_id in list(self._background_transfers.keys()):
+            handles = self._background_transfers[req_id]
+            remaining = []
+            for handle in handles:
+                try:
+                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
+                    if xfer_state == "DONE":
+                        res = self.nixl_wrapper.get_xfer_telemetry(handle)
+                        self.xfer_stats.record_transfer(res)
+                        self.nixl_wrapper.release_xfer_handle(handle)
+                    elif xfer_state in ("PROC", "SENT"):
+                        remaining.append(handle)
+                    else:
+                        logger.warning(
+                            "Background flush error for req=%s: %s",
+                            req_id, xfer_state)
+                        self.nixl_wrapper.release_xfer_handle(handle)
+                except Exception as e:
+                    logger.warning(
+                        "Background flush exception for req=%s: %s",
+                        req_id, e)
+            if remaining:
+                self._background_transfers[req_id] = remaining
+            else:
+                del self._background_transfers[req_id]
 
     def _handle_failed_transfer(self, req_id: str, handle: int):
         """
@@ -2814,6 +3034,13 @@ class NixlConnectorWorker:
         for req_id, proxy_req_id in metadata.reqs_push_recv.items():
             self._push_proxy_to_local_req[proxy_req_id] = req_id
             self._push_recv_reqs.add(req_id)
+        if metadata.reqs_push_recv:
+            logger.info(
+                "TRACE start_load_kv: push_recv reqs added: %s, "
+                "_push_recv_reqs now: %s",
+                dict(metadata.reqs_push_recv),
+                self._push_recv_reqs,
+            )
 
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
@@ -3054,6 +3281,23 @@ class NixlConnectorWorker:
             remote_block_descs_ids = np.concatenate(remote_descs_list)
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
+
+        logger.info(
+            "DIAG _read_blocks req=%s: num_regions=%d, "
+            "local_blocks=%s, remote_blocks=%s, "
+            "total_desc_pairs=%d, "
+            "local_descs_first5=%s, remote_descs_first5=%s, "
+            "local_num_blocks=%d, remote_num_blocks=%d",
+            request_id,
+            self.num_regions,
+            local_block_ids[:5] if len(local_block_ids) > 5 else local_block_ids,
+            remote_block_ids[:5] if len(remote_block_ids) > 5 else remote_block_ids,
+            len(local_block_descs_ids),
+            local_block_descs_ids[:10].tolist(),
+            remote_block_descs_ids[:10].tolist(),
+            self.dst_num_blocks.get(self.engine_id, -1),
+            self.dst_num_blocks.get(dst_engine_id, -1),
+        )
 
         # Prepare transfer with Nixl.
         handle = None

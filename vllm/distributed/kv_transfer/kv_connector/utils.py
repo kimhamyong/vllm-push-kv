@@ -347,13 +347,27 @@ class TpKVTopology:
             except (AttributeError, NotImplementedError):
                 kv_cache_stride_order = tuple(range(len(self.tensor_shape)))
 
-            # permute kv_cache_shape according to stride_order
-            kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
+            # Record block size position in both logical (semantic) and
+            # physical layouts. Per-layer caches are exposed as logical views,
+            # while cross-layer caches are registered in physical layout.
+            logical_kv_cache_shape = kv_cache_shape
+            physical_kv_cache_shape = tuple(
+                kv_cache_shape[i] for i in kv_cache_stride_order
+            )
 
-            physical_block_size_position = kv_cache_shape.index(16)
-            assert physical_block_size_position is not None
+            logical_block_size_position = logical_kv_cache_shape.index(16)
+            physical_block_size_position = physical_kv_cache_shape.index(16)
+            self._logical_block_size_position = -(
+                len(logical_kv_cache_shape) - logical_block_size_position
+            )
             self._physical_block_size_position = -(
-                len(kv_cache_shape) - physical_block_size_position
+                len(physical_kv_cache_shape) - physical_block_size_position
+            )
+
+            self._block_size_position = (
+                self._physical_block_size_position
+                if self._cross_layers_blocks
+                else self._logical_block_size_position
             )
 
     @property
@@ -381,7 +395,7 @@ class TpKVTopology:
 
     @property
     def block_size_position(self) -> int:
-        return self._physical_block_size_position
+        return self._block_size_position
 
     def tp_ratio(
         self,
