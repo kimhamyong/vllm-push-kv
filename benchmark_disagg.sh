@@ -442,7 +442,7 @@ for i, prompt in enumerate(benchmark_prompts):
     try:
         # Use streaming to measure REAL TTFT
         resp = requests.post(f"{PROXY_URL}/v1/completions",
-            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": True, "ignore_eos": True},
+            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": True},
             timeout=300, stream=True)
 
         if resp.status_code == 200:
@@ -590,7 +590,7 @@ def run_one_request(idx, prompt):
     tokens = 0
     try:
         resp = requests.post(f"{PROXY_URL}/v1/completions",
-            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": True, "ignore_eos": True},
+            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": True},
             timeout=300, stream=True)
 
         if resp.status_code == 200:

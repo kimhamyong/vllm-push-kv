@@ -169,7 +169,6 @@ async def _handle_completions(api: str, request: Request):
         prefill_data["stream"] = False
         prefill_data["max_tokens"] = 1
         prefill_data.pop("min_tokens", None)
-        prefill_data.pop("ignore_eos", None)
         if "max_completion_tokens" in prefill_data:
             prefill_data["max_completion_tokens"] = 1
         if "stream_options" in prefill_data:

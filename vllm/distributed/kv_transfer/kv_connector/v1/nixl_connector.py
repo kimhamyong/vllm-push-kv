@@ -771,6 +771,21 @@ class NixlConnectorScheduler:
             token_ids = request.prompt_token_ids or []
             count = len(token_ids) - num_computed_tokens
             if count > 0:
+                # Push mode: if decode already has local prefix cache,
+                # skip push and compute remaining tokens locally.
+                # Mixing locally-cached KV with push-transferred KV
+                # can cause the model to produce 0 output tokens.
+                # Local computation of the residual tokens (~30) is
+                # also faster than the NIXL push overhead (~15ms).
+                if params.get("push_mode") and num_computed_tokens > 0:
+                    logger.info(
+                        "Push mode: skipping remote prefill for req %s "
+                        "(local cache=%d tokens, residual=%d tokens)",
+                        request.request_id,
+                        num_computed_tokens,
+                        count,
+                    )
+                    return 0, False
                 return count, True
 
         # No remote prefill for this request.
@@ -800,11 +815,19 @@ class NixlConnectorScheduler:
 
         # Push mode (Decode side): allocate blocks → send info immediately
         if params.get("push_mode") and params.get("do_remote_prefill"):
-            local_block_ids = (
-                blocks.get_unhashed_block_ids()
-                if num_external_tokens > 0
-                else []
-            )
+            if num_external_tokens == 0:
+                # Full prefix cache hit — no KV transfer needed.
+                # Skip push recv registration so the request proceeds
+                # directly without waiting for a push notification.
+                logger.info(
+                    "Push mode: skipping KV transfer for req %s "
+                    "(prefix cache hit, ext_tokens=0)",
+                    request.request_id,
+                )
+                params["do_remote_prefill"] = False
+                return
+
+            local_block_ids = blocks.get_unhashed_block_ids()
             block_info = {
                 "request_id": params["proxy_request_id"],
                 "engine_id": self.engine_id,
