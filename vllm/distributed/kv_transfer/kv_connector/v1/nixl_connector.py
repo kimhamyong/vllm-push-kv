@@ -466,6 +466,11 @@ class NixlConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         self.connector_worker.set_host_xfer_buffer_ops(copy_operation)
 
+    def bind_connector_metadata(self, connector_metadata: KVConnectorMetadata) -> None:
+        super().bind_connector_metadata(connector_metadata)
+        if self.connector_worker is not None:
+            self.connector_worker.reset_host_save_state()
+
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
@@ -522,6 +527,12 @@ class NixlConnector(KVConnectorBase_V1):
     ) -> None:
         """Push mode: delegate per-layer WRITE to worker."""
         assert self.connector_worker is not None
+        assert isinstance(self._connector_metadata, NixlConnectorMetadata)
+        if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:
+            self.connector_worker.save_kv_layer_to_host(
+                layer_name, self._connector_metadata
+            )
+            return
         self.connector_worker.save_kv_layer(
             layer_name, kv_layer, attn_metadata
         )
@@ -530,7 +541,10 @@ class NixlConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, NixlConnectorMetadata)
         if self.connector_worker.use_host_buffer and self.connector_worker.copy_blocks:
-            self.connector_worker.save_kv_to_host(self._connector_metadata)
+            if self.connector_worker.has_per_layer_host_save():
+                self.connector_worker.sync_host_xfer_stream()
+            else:
+                self.connector_worker.save_kv_to_host(self._connector_metadata)
         # Push mode: wait for all WRITE transfers to complete
         self.connector_worker.wait_for_push_complete()
 
@@ -1231,6 +1245,9 @@ class NixlConnectorWorker:
         self._model_num_layers = (
             vllm_config.model_config.get_total_num_hidden_layers()
         )
+        # Host buffer per-layer save state
+        self._host_xfer_stream: torch.cuda.Stream | None = None
+        self._host_save_per_layer = False
 
     def _nixl_handshake(
         self,
@@ -1393,6 +1410,24 @@ class NixlConnectorWorker:
             return
         assert self.use_host_buffer
         self.copy_blocks = copy_operation
+
+    def _get_host_xfer_stream(self) -> torch.cuda.Stream | None:
+        if self.device_type != "cuda" or not torch.cuda.is_available():
+            return None
+        if self._host_xfer_stream is None:
+            self._host_xfer_stream = torch.cuda.Stream()
+        return self._host_xfer_stream
+
+    def reset_host_save_state(self) -> None:
+        self._host_save_per_layer = False
+
+    def has_per_layer_host_save(self) -> bool:
+        return self._host_save_per_layer
+
+    def sync_host_xfer_stream(self) -> None:
+        stream = self._get_host_xfer_stream()
+        if stream is not None:
+            stream.synchronize()
 
     def _log_failure(
         self,
@@ -2212,6 +2247,77 @@ class NixlConnectorWorker:
                 meta.local_physical_block_ids,
                 "d2h",
             )
+
+    def save_kv_layer_to_host(
+        self,
+        layer_name: str,
+        metadata: NixlConnectorMetadata,
+    ) -> None:
+        """Copy a single KV layer from device to host buffer (async on stream)."""
+        assert self.use_host_buffer
+        assert self.copy_blocks is not None
+
+        if not metadata.reqs_to_save:
+            return
+        if layer_name not in self.device_kv_caches:
+            return
+        if layer_name not in self.host_xfer_buffers:
+            return
+
+        src_layer = {layer_name: self.device_kv_caches[layer_name]}
+        dst_layer = {layer_name: self.host_xfer_buffers[layer_name]}
+
+        stream = self._get_host_xfer_stream()
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for req_id, meta in metadata.reqs_to_save.items():
+                    if meta.local_physical_block_ids is meta.local_block_ids:
+                        meta.local_physical_block_ids = (
+                            self._logical_to_kernel_block_ids(
+                                meta.local_block_ids
+                            )
+                        )
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "save_kv_layer_to_host req=%s layer=%s "
+                            "local_block_ids=%s",
+                            req_id,
+                            layer_name,
+                            ",".join(map(str, meta.local_physical_block_ids)),
+                        )
+                    self.copy_blocks(
+                        src_layer,
+                        dst_layer,
+                        meta.local_physical_block_ids,
+                        meta.local_physical_block_ids,
+                        "d2h",
+                    )
+        else:
+            for req_id, meta in metadata.reqs_to_save.items():
+                if meta.local_physical_block_ids is meta.local_block_ids:
+                    meta.local_physical_block_ids = (
+                        self._logical_to_kernel_block_ids(
+                            meta.local_block_ids
+                        )
+                    )
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "save_kv_layer_to_host req=%s layer=%s "
+                        "local_block_ids=%s",
+                        req_id,
+                        layer_name,
+                        ",".join(map(str, meta.local_physical_block_ids)),
+                    )
+                self.copy_blocks(
+                    src_layer,
+                    dst_layer,
+                    meta.local_physical_block_ids,
+                    meta.local_physical_block_ids,
+                    "d2h",
+                )
+
+        self._host_save_per_layer = True
 
     def post_process_device_kv_on_receive(
         self,
