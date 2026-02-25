@@ -437,30 +437,54 @@ for i, prompt in enumerate(benchmark_prompts):
     nixl_before = get_nixl_metrics_both()
 
     start = time.perf_counter()
+    ttft = None
+    tokens = 0
     try:
+        # Use streaming to measure REAL TTFT
         resp = requests.post(f"{PROXY_URL}/v1/completions",
-            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0}, timeout=300)
-        latency = (time.perf_counter() - start) * 1000
-
-        # Get NIXL metrics AFTER this request
-        nixl_after = get_nixl_metrics_both()
-
-        # Calculate NIXL transfer time for THIS request
-        nixl_xfer_ms = 0
-        nixl_bytes_kb = 0
-        if nixl_before and nixl_after:
-            xfer_time_diff = nixl_after.get('vllm:nixl_xfer_time_seconds_sum', 0) - nixl_before.get('vllm:nixl_xfer_time_seconds_sum', 0)
-            bytes_diff = nixl_after.get('vllm:nixl_bytes_transferred_sum', 0) - nixl_before.get('vllm:nixl_bytes_transferred_sum', 0)
-            nixl_xfer_ms = xfer_time_diff * 1000
-            nixl_bytes_kb = bytes_diff / 1024
+            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": True, "ignore_eos": True},
+            timeout=300, stream=True)
 
         if resp.status_code == 200:
-            resp_json = resp.json()
-            tokens = resp_json.get("usage", {}).get("completion_tokens", OUTPUT_LEN)
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                chunk_data = line[6:]
+                if chunk_data.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(chunk_data)
+                    if ttft is None:
+                        ttft = (time.perf_counter() - start) * 1000
+                    choice = chunk.get("choices", [{}])[0]
+                    txt = choice.get("text", "")
+                    if txt:
+                        tokens += 1
+                    # Check for finish_reason
+                    usage = chunk.get("usage")
+                    if usage and usage.get("completion_tokens"):
+                        tokens = usage["completion_tokens"]
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
-            # TTFT, TPOT 추정
-            ttft = latency * 0.3
-            tpot = (latency - ttft) / max(tokens, 1)
+            latency = (time.perf_counter() - start) * 1000
+
+            # Get NIXL metrics AFTER this request
+            nixl_after = get_nixl_metrics_both()
+
+            nixl_xfer_ms = 0
+            nixl_bytes_kb = 0
+            if nixl_before and nixl_after:
+                xfer_time_diff = nixl_after.get('vllm:nixl_xfer_time_seconds_sum', 0) - nixl_before.get('vllm:nixl_xfer_time_seconds_sum', 0)
+                bytes_diff = nixl_after.get('vllm:nixl_bytes_transferred_sum', 0) - nixl_before.get('vllm:nixl_bytes_transferred_sum', 0)
+                nixl_xfer_ms = xfer_time_diff * 1000
+                nixl_bytes_kb = bytes_diff / 1024
+
+            if tokens == 0:
+                tokens = OUTPUT_LEN
+            if ttft is None:
+                ttft = latency * 0.3
+            tpot = (latency - ttft) / max(tokens - 1, 1)
 
             latencies.append(latency)
             ttft_values.append(ttft)
@@ -478,10 +502,10 @@ for i, prompt in enumerate(benchmark_prompts):
                 "nixl_bytes_kb": round(nixl_bytes_kb, 2),
                 "completion_tokens": tokens
             })
-            print(f"  Request {i+1}: latency={latency:.2f}ms, NIXL_xfer={nixl_xfer_ms:.2f}ms, tokens={tokens}")
+            print(f"  Request {i+1}: latency={latency:.2f}ms, TTFT={ttft:.2f}ms, NIXL_xfer={nixl_xfer_ms:.2f}ms, tokens={tokens}")
         else:
             measurements.append({"request_id": i+1, "status": "failed"})
-            print(f"  Request {i+1}: FAILED")
+            print(f"  Request {i+1}: FAILED (status={resp.status_code})")
     except Exception as e:
         measurements.append({"request_id": i+1, "status": "error", "error": str(e)})
         print(f"  Request {i+1}: ERROR - {e}")
@@ -559,28 +583,53 @@ conc_tpot_values = []
 conc_total_tokens = 0
 
 def run_one_request(idx, prompt):
-    """Send one request and return measurement dict."""
+    """Send one request with streaming to measure real TTFT."""
     nixl_before = get_nixl_metrics_both()
     start = time.perf_counter()
+    ttft = None
+    tokens = 0
     try:
         resp = requests.post(f"{PROXY_URL}/v1/completions",
-            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0}, timeout=300)
-        latency = (time.perf_counter() - start) * 1000
-
-        nixl_after = get_nixl_metrics_both()
-        nixl_xfer_ms = 0
-        nixl_bytes_kb = 0
-        if nixl_before and nixl_after:
-            xfer_time_diff = nixl_after.get('vllm:nixl_xfer_time_seconds_sum', 0) - nixl_before.get('vllm:nixl_xfer_time_seconds_sum', 0)
-            bytes_diff = nixl_after.get('vllm:nixl_bytes_transferred_sum', 0) - nixl_before.get('vllm:nixl_bytes_transferred_sum', 0)
-            nixl_xfer_ms = xfer_time_diff * 1000
-            nixl_bytes_kb = bytes_diff / 1024
+            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": True, "ignore_eos": True},
+            timeout=300, stream=True)
 
         if resp.status_code == 200:
-            resp_json = resp.json()
-            tokens = resp_json.get("usage", {}).get("completion_tokens", OUTPUT_LEN)
-            ttft = latency * 0.3
-            tpot = (latency - ttft) / max(tokens, 1)
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                chunk_data = line[6:]
+                if chunk_data.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(chunk_data)
+                    if ttft is None:
+                        ttft = (time.perf_counter() - start) * 1000
+                    choice = chunk.get("choices", [{}])[0]
+                    txt = choice.get("text", "")
+                    if txt:
+                        tokens += 1
+                    usage = chunk.get("usage")
+                    if usage and usage.get("completion_tokens"):
+                        tokens = usage["completion_tokens"]
+                except (json.JSONDecodeError, KeyError):
+                    pass
+
+            latency = (time.perf_counter() - start) * 1000
+
+            nixl_after = get_nixl_metrics_both()
+            nixl_xfer_ms = 0
+            nixl_bytes_kb = 0
+            if nixl_before and nixl_after:
+                xfer_time_diff = nixl_after.get('vllm:nixl_xfer_time_seconds_sum', 0) - nixl_before.get('vllm:nixl_xfer_time_seconds_sum', 0)
+                bytes_diff = nixl_after.get('vllm:nixl_bytes_transferred_sum', 0) - nixl_before.get('vllm:nixl_bytes_transferred_sum', 0)
+                nixl_xfer_ms = xfer_time_diff * 1000
+                nixl_bytes_kb = bytes_diff / 1024
+
+            if tokens == 0:
+                tokens = OUTPUT_LEN
+            if ttft is None:
+                ttft = latency * 0.3
+            tpot = (latency - ttft) / max(tokens - 1, 1)
             return {
                 "request_id": idx+1, "status": "success",
                 "latency_ms": round(latency, 2), "ttft_ms": round(ttft, 2),
@@ -670,7 +719,7 @@ if conc_latencies:
 # =============================================================================
 # 3. Accuracy Verification
 # =============================================================================
-print("\n=== 3. Accuracy Verification ===")
+print("\n=== 3. Accuracy Verification (streaming, same as benchmark) ===")
 test_cases = [
     {"prompt": "The capital of France is", "expected": ["Paris", "paris"], "max_tokens": 10},
     {"prompt": "2 + 2 =", "expected": ["4", "four"], "max_tokens": 5},
@@ -683,10 +732,26 @@ passed = 0
 
 for i, tc in enumerate(test_cases):
     try:
+        # Use streaming (same code path as benchmark)
         resp = requests.post(f"{PROXY_URL}/v1/completions",
-            json={"model": MODEL_NAME, "prompt": tc["prompt"], "max_tokens": tc["max_tokens"], "temperature": 0}, timeout=60)
+            json={"model": MODEL_NAME, "prompt": tc["prompt"], "max_tokens": tc["max_tokens"], "temperature": 0, "stream": True},
+            timeout=60, stream=True)
         if resp.status_code == 200:
-            completion = resp.json()["choices"][0]["text"].strip()
+            completion_parts = []
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                chunk_data = line[6:]
+                if chunk_data.strip() == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(chunk_data)
+                    txt = chunk.get("choices", [{}])[0].get("text", "")
+                    if txt:
+                        completion_parts.append(txt)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+            completion = "".join(completion_parts).strip()
             match = any(e.lower() in completion.lower() for e in tc["expected"])
             accuracy_tests.append({
                 "test_id": i+1, "prompt": tc["prompt"], "completion": completion,
@@ -698,9 +763,11 @@ for i, tc in enumerate(test_cases):
             else:
                 print(f"  Test {i+1}: FAIL - got '{completion[:40]}'")
         else:
-            accuracy_tests.append({"test_id": i+1, "passed": False, "status": "http_error"})
+            accuracy_tests.append({"test_id": i+1, "passed": False, "status": "http_error", "response_code": resp.status_code})
+            print(f"  Test {i+1}: HTTP {resp.status_code}")
     except Exception as e:
         accuracy_tests.append({"test_id": i+1, "passed": False, "status": "error", "error": str(e)})
+        print(f"  Test {i+1}: ERROR - {e}")
 
 result["accuracy"] = {
     "test_cases": accuracy_tests,

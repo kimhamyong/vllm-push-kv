@@ -9,7 +9,7 @@ echo "Prefill: http://$PREFILL_IP:8100"
 echo "Decode: http://$DECODE_IP:8200"
 echo "Mode: Push (prefill WRITE per-layer)"
 
-python3 ~/push_proxy_server.py \
+python3 /home/ubuntu/vllm/push_proxy_server.py \
     --port 8000 \
     --prefiller-hosts $PREFILL_IP \
     --prefiller-ports 8100 \

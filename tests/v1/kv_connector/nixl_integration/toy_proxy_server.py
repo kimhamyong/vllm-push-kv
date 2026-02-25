@@ -169,6 +169,8 @@ async def send_request_to_service(
     }
     req_data["stream"] = False
     req_data["max_tokens"] = 1
+    req_data.pop("min_tokens", None)
+    req_data.pop("ignore_eos", None)
     if "max_completion_tokens" in req_data:
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:

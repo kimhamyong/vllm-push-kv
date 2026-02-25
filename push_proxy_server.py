@@ -159,7 +159,7 @@ async def _handle_completions(api: str, request: Request):
             "[PushProxy] req=%s prefill=%s decode=%s",
             request_id, prefill_client["id"], decode_client["id"])
 
-        # Prefill request: compute + push KV (non-streaming, fire-and-forget)
+        # Prefill request data (sent AFTER decode to let block alloc happen first)
         prefill_data = req_data.copy()
         prefill_data["kv_transfer_params"] = {
             "do_remote_decode": True,
@@ -168,14 +168,12 @@ async def _handle_completions(api: str, request: Request):
         }
         prefill_data["stream"] = False
         prefill_data["max_tokens"] = 1
+        prefill_data.pop("min_tokens", None)
+        prefill_data.pop("ignore_eos", None)
         if "max_completion_tokens" in prefill_data:
             prefill_data["max_completion_tokens"] = 1
         if "stream_options" in prefill_data:
             del prefill_data["stream_options"]
-
-        prefill_task = asyncio.create_task(
-            prefill_client["client"].post(
-                api, json=prefill_data, headers=headers))
 
         # Decode request: allocate → push block info to Prefill ZMQ →
         # wait for push notification → generate (streaming)
@@ -188,7 +186,21 @@ async def _handle_completions(api: str, request: Request):
             "proxy_request_id": request_id,
         }
 
+        # Delay (ms) before sending prefill request.
+        # Gives decode time to alloc blocks + send ZMQ block_info,
+        # so prefill's save_kv_layer() finds block_info ready (no pending).
+        prefill_delay_s = float(os.environ.get(
+            "PUSH_PREFILL_DELAY_MS", "20")) / 1000.0
+
+        async def _delayed_prefill():
+            """Send prefill request after a short delay."""
+            await asyncio.sleep(prefill_delay_s)
+            return await prefill_client["client"].post(
+                api, json=prefill_data, headers=headers)
+
         async def generate():
+            # Fire prefill AFTER decode stream starts (decode allocs first)
+            prefill_task = asyncio.create_task(_delayed_prefill())
             try:
                 async with decode_client["client"].stream(
                     "POST", api, json=decode_data, headers=headers

@@ -516,7 +516,11 @@ class NixlConnector(KVConnectorBase_V1):
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Push mode (Decode): wait for push notification before forward."""
         assert self.connector_worker is not None
-        self.connector_worker.wait_for_push_recv()
+        if (self.connector_worker._push_recv_layer_pending
+                and not self.connector_worker._is_all_layers_mode):
+            self.connector_worker.wait_for_layer_push_recv(layer_name)
+        else:
+            self.connector_worker.wait_for_push_recv()
 
     def save_kv_layer(
         self,
@@ -1216,6 +1220,9 @@ class NixlConnectorWorker:
         # In-progress WRITE transfer handles
         self._sending_transfers = defaultdict[ReqId, list[TransferHandle]](
             list)
+        # Per-layer push pipelining: req_id -> {layer_idx: handle}
+        self._push_layer_transfers = defaultdict[ReqId, dict[int, TransferHandle]](
+            dict)
         # Background flush transfers (SENT → DONE): handles moved here
         # when async ACK is enabled and GPU was released at SENT state.
         self._background_transfers: dict[ReqId, list[TransferHandle]] = {}
@@ -1229,6 +1236,8 @@ class NixlConnectorWorker:
         self._push_done_recving: set[ReqId] = set()
         # Push mode (Decode): proxy_request_id -> vllm_decode_request_id
         self._push_proxy_to_local_req: dict[str, ReqId] = {}
+        # Per-layer push pipelining (Decode side)
+        self._push_recv_layer_pending: dict[ReqId, set[int]] = {}
         # Worker push listener thread
         self._push_listener_thread: threading.Thread | None = None
         self._push_listener_stop_event = threading.Event()
@@ -2442,12 +2451,9 @@ class NixlConnectorWorker:
             # will be issued at the last model layer or in
             # wait_for_push_complete().
             if not self._is_all_layers_mode and current_layer_idx > 0:
-                logger.info(
-                    "CATCH-UP WRITE req=%s resolved_at_layer=%d "
-                    "catch_up_layers=0..%d",
-                    req_id,
-                    current_layer_idx,
-                    current_layer_idx - 1,
+                logger.debug(
+                    "CATCH-UP WRITE req=%s layers=0..%d",
+                    req_id, current_layer_idx - 1,
                 )
                 for missed_layer in range(current_layer_idx):
                     is_last = missed_layer == self.num_layers - 1
@@ -2487,7 +2493,8 @@ class NixlConnectorWorker:
         )
 
         notif = b""
-        if is_last_layer:
+        if is_last_layer and (self._is_all_layers_mode or write_layer_idx is None):
+            # ALL_LAYERS mode keeps legacy piggybacked notification.
             notif_id = target["notif_id"]
             notif = f"{notif_id}:{self.world_size}".encode()
 
@@ -2498,15 +2505,11 @@ class NixlConnectorWorker:
             self.tp_rank
         ]
 
-        logger.info(
-            "WRITE prep req=%s layer_idx=%s local_blocks=%s(%d) "
-            "remote_blocks=%s(%d) local_descs=%s remote_descs=%s "
-            "notif=%s num_layers=%d num_regions=%d",
+        logger.debug(
+            "WRITE prep req=%s layer_idx=%s local_blocks=%d "
+            "remote_blocks=%d notif=%s",
             req_id, write_layer_idx,
-            local_block_ids, len(local_block_ids),
-            remote_block_ids, len(remote_block_ids),
-            local_descs.shape, remote_descs.shape,
-            notif, self.num_layers, self.num_regions,
+            len(local_block_ids), len(remote_block_ids), notif,
         )
 
         handle = None
@@ -2520,12 +2523,13 @@ class NixlConnectorWorker:
                 notif_msg=notif,
             )
             self.nixl_wrapper.transfer(handle)
-            self._sending_transfers[req_id].append(handle)
-            logger.info(
-                "WRITE issued req=%s layer=%s is_last=%s",
-                req_id,
-                write_layer_idx,
-                is_last_layer,
+            if write_layer_idx is not None and not self._is_all_layers_mode:
+                self._push_layer_transfers[req_id][write_layer_idx] = handle
+            else:
+                self._sending_transfers[req_id].append(handle)
+            logger.debug(
+                "WRITE issued req=%s layer=%s",
+                req_id, write_layer_idx,
             )
         except Exception as e:
             logger.error(
@@ -2537,6 +2541,96 @@ class NixlConnectorWorker:
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
 
+    def _poll_push_layer_completions(self) -> None:
+        """Poll per-layer WRITE handles and send L: notifications on DONE."""
+        if not self._push_layer_transfers:
+            return
+        for req_id, layer_handles in list(self._push_layer_transfers.items()):
+            target = self._push_targets.get(req_id)
+            if target is None:
+                continue
+            target_engine_id = target["engine_id"]
+            notif_id = target["notif_id"]
+            agent_name = self._remote_agents.get(target_engine_id, {}).get(
+                self.tp_rank
+            )
+            if agent_name is None:
+                continue
+            for layer_idx, handle in list(layer_handles.items()):
+                try:
+                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
+                    if xfer_state == "DONE":
+                        res = self.nixl_wrapper.get_xfer_telemetry(handle)
+                        self.xfer_stats.record_transfer(res)
+                        self.nixl_wrapper.release_xfer_handle(handle)
+                        notif = (
+                            f"L:{notif_id}:{layer_idx}:{self.world_size}"
+                        ).encode()
+                        self.nixl_wrapper.send_notif(agent_name, notif)
+                        del layer_handles[layer_idx]
+                    elif xfer_state in ("PROC", "SENT"):
+                        continue
+                    else:
+                        self._log_failure(
+                            failure_type="transfer_failed",
+                            msg="Marking blocks as invalid",
+                            req_id=req_id,
+                            xfer_state=xfer_state,
+                        )
+                        self._handle_failed_transfer(req_id, handle)
+                        del layer_handles[layer_idx]
+                except Exception as e:
+                    self._log_failure(
+                        failure_type="transfer_exception",
+                        msg="Marking blocks as invalid",
+                        req_id=req_id,
+                        error=e,
+                    )
+                    self._handle_failed_transfer(req_id, handle)
+                    del layer_handles[layer_idx]
+            if not layer_handles:
+                # All layers for this request done — send D: immediately
+                # so Decode unblocks without waiting for batch drain.
+                done_notif = (
+                    f"D:{notif_id}:{self.world_size}"
+                ).encode()
+                self.nixl_wrapper.send_notif(agent_name, done_notif)
+                del self._push_layer_transfers[req_id]
+                self._push_targets.pop(req_id, None)
+
+    def _drain_push_layer_transfers(self) -> None:
+        """Block until all per-layer WRITE handles reach DONE."""
+        if not self._push_layer_transfers:
+            return
+        timeout_s = 30.0
+        start = time.perf_counter()
+        while self._push_layer_transfers:
+            self._poll_push_layer_completions()
+            if not self._push_layer_transfers:
+                break
+            if time.perf_counter() - start > timeout_s:
+                logger.error(
+                    "Push WRITE DONE timeout after %.1fs, "
+                    "%d requests still pending",
+                    timeout_s,
+                    len(self._push_layer_transfers),
+                )
+                break
+            time.sleep(0.001)
+
+    def _send_push_done_notifications(self) -> None:
+        """Send D: notifications after all per-layer transfers complete."""
+        for req_id, target in list(self._push_targets.items()):
+            target_engine_id = target["engine_id"]
+            notif_id = target["notif_id"]
+            agent_name = self._remote_agents.get(target_engine_id, {}).get(
+                self.tp_rank
+            )
+            if agent_name is None:
+                continue
+            done_notif = f"D:{notif_id}:{self.world_size}".encode()
+            self.nixl_wrapper.send_notif(agent_name, done_notif)
+
     _last_save_kv_ts: float = 0.0
 
     def save_kv_layer(
@@ -2546,20 +2640,14 @@ class NixlConnectorWorker:
         attn_metadata: "AttentionMetadata",
     ) -> None:
         """Push mode: WRITE KV cache per-layer to Decode."""
-        import re
-        import time as _time
-
         # Poll background flush handles from previous async ACK requests.
         # Completed handles (DONE) are released; still-pending ones remain.
         self._drain_background_pushes()
 
-        _t0 = _time.perf_counter()
-        _gap = (_t0 - self._last_save_kv_ts) * 1000 if self._last_save_kv_ts > 0 else -1.0
-        self._last_save_kv_ts = _t0
-
         # Map layer_name to model layer_idx
         layer_idx = self._layer_name_to_idx.get(layer_name)
         if layer_idx is None:
+            import re
             match = re.search(r"layers\.(\d+)", layer_name)
             if match:
                 layer_idx = int(match.group(1))
@@ -2567,19 +2655,17 @@ class NixlConnectorWorker:
             else:
                 return
 
-        _had_pending = bool(self._pending_push_reqs)
         # Resolve any pending push requests that now have block info
         if self._pending_push_reqs:
             self._resolve_pending_pushes(layer_idx)
 
         if not self._push_targets:
-            logger.info(
-                "save_kv_layer layer=%d gap=%.3fms no_targets "
-                "had_pending=%s pending_left=%d",
-                layer_idx,
-                _gap,
-                _had_pending,
-                len(self._pending_push_reqs),
+            # Still poll existing per-layer handles from prior iterations
+            # (handles from earlier requests may have completed).
+            self._poll_push_layer_completions()
+            logger.debug(
+                "save_kv_layer layer=%d no_targets pending=%d",
+                layer_idx, len(self._pending_push_reqs),
             )
             return
 
@@ -2602,13 +2688,9 @@ class NixlConnectorWorker:
         else:
             # Per-layer mode: WRITE each layer individually.
             is_last_layer = layer_idx == self.num_layers - 1
-            logger.info(
-                "save_kv_layer WRITE layer=%d/%d is_last=%s "
-                "gap=%.3fms targets=%d",
-                layer_idx,
-                self.num_layers - 1,
-                is_last_layer,
-                _gap,
+            logger.debug(
+                "save_kv_layer WRITE layer=%d/%d targets=%d",
+                layer_idx, self.num_layers - 1,
                 len(self._push_targets),
             )
             for req_id, target in self._push_targets.items():
@@ -2619,6 +2701,8 @@ class NixlConnectorWorker:
                     layer_idx=layer_idx,
                     is_last_layer=is_last_layer,
                 )
+            # Poll for completed per-layer WRITEs and send L: notifications.
+            self._poll_push_layer_completions()
 
     def wait_for_push_recv(self) -> None:
         """Block until all push recv requests have received notification.
@@ -2648,6 +2732,48 @@ class NixlConnectorWorker:
                 # Move remaining to done to unblock forward pass
                 self._push_done_recving.update(self._push_recv_reqs)
                 self._push_recv_reqs.clear()
+                break
+            time.sleep(0.001)
+
+    def wait_for_layer_push_recv(self, layer_name: str) -> None:
+        """Block until the specific layer has been pushed for all pending reqs."""
+        import re
+        if not self._push_recv_layer_pending:
+            return
+        # Map layer_name to model layer_idx
+        layer_idx = self._layer_name_to_idx.get(layer_name)
+        if layer_idx is None:
+            match = re.search(r"layers\.(\d+)", layer_name)
+            if match:
+                layer_idx = int(match.group(1))
+                self._layer_name_to_idx[layer_name] = layer_idx
+            else:
+                return
+
+        timeout_s = 60.0
+        start = time.perf_counter()
+        while True:
+            self._get_new_notifs()
+            still_pending = any(
+                layer_idx in pending
+                for pending in self._push_recv_layer_pending.values()
+            )
+            if not still_pending:
+                break
+            if time.perf_counter() - start > timeout_s:
+                logger.error(
+                    "Push recv layer timeout after %.1fs for layer %d, "
+                    "%d requests still pending",
+                    timeout_s,
+                    layer_idx,
+                    sum(
+                        1 for pending in self._push_recv_layer_pending.values()
+                        if layer_idx in pending
+                    ),
+                )
+                # Force clear this layer to unblock forward pass
+                for pending in self._push_recv_layer_pending.values():
+                    pending.discard(layer_idx)
                 break
             time.sleep(0.001)
 
@@ -2687,6 +2813,9 @@ class NixlConnectorWorker:
                         len(self._pending_push_reqs),
                     )
                     break
+                # Poll per-layer handles while waiting for pending resolution
+                # so L:/D: notifications are sent without delay.
+                self._poll_push_layer_completions()
                 time.sleep(0.005)
 
             # Issue bulk WRITE for requests resolved in this fallback.
@@ -2707,6 +2836,15 @@ class NixlConnectorWorker:
                         layer_idx=0,
                         is_last_layer=True,
                     )
+
+        # Per-layer mode: drain remaining handles, send D: notifications.
+        if self._push_layer_transfers and not self._is_all_layers_mode:
+            self._drain_push_layer_transfers()
+            self._send_push_done_notifications()
+            self._push_targets.clear()
+            self._pending_push_reqs.clear()
+            self._push_layer_transfers.clear()
+            return
 
         if not self._sending_transfers:
             # Clean up push state
@@ -2912,13 +3050,44 @@ class NixlConnectorWorker:
         notified_req_ids: set[str] = set()
         for notifs in self.nixl_wrapper.get_new_notifs().values():
             for notif in notifs:
-                req_id, tp_size = notif.decode("utf-8").rsplit(":", 1)
+                msg = notif.decode("utf-8")
+                # Per-layer push notifications: L:<proxy_req_id>:<layer_idx>:<tp_size>
+                if msg.startswith("L:"):
+                    _, proxy_req_id, layer_s, _tp = msg.split(":", 3)
+                    local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
+                    if local_req_id is not None:
+                        pending = self._push_recv_layer_pending.get(local_req_id)
+                        if pending is not None:
+                            try:
+                                pending.discard(int(layer_s))
+                            except ValueError:
+                                pass
+                    continue
 
-                # Push mode: check if this is a push WRITE notification
+                # Request completion notifications: D:<proxy_req_id>:<tp_size>
+                if msg.startswith("D:"):
+                    _, proxy_req_id, _tp = msg.split(":", 2)
+                    local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
+                    if local_req_id is not None:
+                        self._push_recv_reqs.discard(local_req_id)
+                        self._push_done_recving.add(local_req_id)
+                        self._push_recv_layer_pending.pop(local_req_id, None)
+                        del self._push_proxy_to_local_req[proxy_req_id]
+                        logger.debug(
+                            "Push notification received for req=%s "
+                            "(proxy_id=%s)",
+                            local_req_id,
+                            proxy_req_id,
+                        )
+                    continue
+
+                # Legacy format: <proxy_req_id>:<tp_size>
+                req_id, tp_size = msg.rsplit(":", 1)
                 local_req_id = self._push_proxy_to_local_req.get(req_id)
                 if local_req_id is not None:
                     self._push_recv_reqs.discard(local_req_id)
                     self._push_done_recving.add(local_req_id)
+                    self._push_recv_layer_pending.pop(local_req_id, None)
                     del self._push_proxy_to_local_req[req_id]
                     logger.debug(
                         "Push notification received for req=%s "
@@ -3140,6 +3309,10 @@ class NixlConnectorWorker:
         for req_id, proxy_req_id in metadata.reqs_push_recv.items():
             self._push_proxy_to_local_req[proxy_req_id] = req_id
             self._push_recv_reqs.add(req_id)
+            if not self._is_all_layers_mode:
+                self._push_recv_layer_pending[req_id] = set(
+                    range(self.num_layers)
+                )
         if metadata.reqs_push_recv:
             logger.info(
                 "TRACE start_load_kv: push_recv reqs added: %s, "
