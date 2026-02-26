@@ -2653,6 +2653,23 @@ class NixlConnectorWorker:
                 break
             time.sleep(0.001)
 
+        # D: was sent above (in _poll_push_layer_completions).
+        # Now drain background handles to DONE and send L: immediately,
+        # so Decode's per-layer wait doesn't stall until next request.
+        if self._background_layer_notif_handles:
+            drain_start = time.perf_counter()
+            while self._background_layer_notif_handles:
+                self._drain_background_pushes()
+                if not self._background_layer_notif_handles:
+                    break
+                if time.perf_counter() - drain_start > 30.0:
+                    logger.error(
+                        "Background L: drain timeout, %d handles remain",
+                        len(self._background_layer_notif_handles),
+                    )
+                    break
+                time.sleep(0.001)
+
     def _send_push_done_notifications(self) -> None:
         """Send D: notifications after all per-layer transfers complete."""
         for req_id, target in list(self._push_targets.items()):
