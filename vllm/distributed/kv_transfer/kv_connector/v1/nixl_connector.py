@@ -2614,28 +2614,51 @@ class NixlConnectorWorker:
             )
             if agent_name is None:
                 continue
+            is_partial = target.get("is_partial", False)
             for layer_idx, handle in list(layer_handles.items()):
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                     if xfer_state == "DONE":
-                        res = self.nixl_wrapper.get_xfer_telemetry(handle)
-                        self.xfer_stats.record_transfer(res)
-                        self.nixl_wrapper.release_xfer_handle(handle)
-                        notif = (
-                            f"L:{notif_id}:{layer_idx}:{self.world_size}"
-                        ).encode()
-                        self.nixl_wrapper.send_notif(agent_name, notif)
-                        logger.info(
-                            "Sent L: notif req=%s layer=%d to %s",
-                            req_id, layer_idx, agent_name)
+                        if not is_partial:
+                            if self._background_layer_handles:
+                                # 중간 chunk 데이터가 아직 in-flight.
+                                # L: 지연 — handle DONE이므로 background
+                                # drain에서 즉시 처리됨.
+                                self._background_layer_notif_handles.append(
+                                    (handle, agent_name, notif_id,
+                                     layer_idx))
+                            else:
+                                # 중간 chunk 없음 — L: 즉시 전송 안전.
+                                res = (self.nixl_wrapper
+                                       .get_xfer_telemetry(handle))
+                                self.xfer_stats.record_transfer(res)
+                                self.nixl_wrapper.release_xfer_handle(
+                                    handle)
+                                notif = (
+                                    f"L:{notif_id}:{layer_idx}"
+                                    f":{self.world_size}"
+                                ).encode()
+                                self.nixl_wrapper.send_notif(
+                                    agent_name, notif)
+                                logger.info(
+                                    "Sent L: notif req=%s layer=%d "
+                                    "to %s",
+                                    req_id, layer_idx, agent_name)
+                        else:
+                            # 중간 chunk: telemetry+release만, L: 안 보냄
+                            res = (self.nixl_wrapper
+                                   .get_xfer_telemetry(handle))
+                            self.xfer_stats.record_transfer(res)
+                            self.nixl_wrapper.release_xfer_handle(handle)
                         del layer_handles[layer_idx]
                     elif xfer_state == "SENT" and self._push_async_ack:
-                        # Data copied to CPU buffer — GPU can be freed.
-                        # Do NOT send L: here; L: is deferred until DONE
-                        # to guarantee GPU data arrival on Decode side.
-                        # Move handle to background for DONE tracking.
-                        self._background_layer_notif_handles.append(
-                            (handle, agent_name, notif_id, layer_idx))
+                        if not is_partial:
+                            # 마지막 chunk: background에서 DONE 시 L: 전송
+                            self._background_layer_notif_handles.append(
+                                (handle, agent_name, notif_id, layer_idx))
+                        else:
+                            # 중간 chunk: L: 없이 handle release만 추적
+                            self._background_layer_handles.append(handle)
                         del layer_handles[layer_idx]
                     elif xfer_state in ("PROC", "SENT"):
                         continue
@@ -2698,8 +2721,50 @@ class NixlConnectorWorker:
             time.sleep(0.001)
 
         # D: was sent above (in _poll_push_layer_completions).
-        # Now drain background handles to DONE and send L: immediately,
-        # so Decode's per-layer wait doesn't stall until next request.
+        #
+        # CRITICAL: 중간 chunk background handles를 먼저 drain.
+        # 중간 chunk(is_partial=True)의 WRITE handles가
+        # _background_layer_handles에 L: 없이 저장됨.
+        # 이 데이터가 decode GPU 메모리에 도착 확인된 후에야
+        # 최종 chunk의 L:을 보내야 함 — 그렇지 않으면 decode가
+        # in-flight KV 블록으로 forward pass → garbage → EOS.
+        if self._background_layer_handles:
+            drain_start = time.perf_counter()
+            while self._background_layer_handles:
+                remaining: list[int] = []
+                for handle in self._background_layer_handles:
+                    try:
+                        st = self.nixl_wrapper.check_xfer_state(handle)
+                        if st == "DONE":
+                            res = self.nixl_wrapper.get_xfer_telemetry(
+                                handle)
+                            self.xfer_stats.record_transfer(res)
+                            self.nixl_wrapper.release_xfer_handle(handle)
+                        elif st in ("PROC", "SENT"):
+                            remaining.append(handle)
+                        else:
+                            logger.warning(
+                                "Background layer handle error: %s", st)
+                            self.nixl_wrapper.release_xfer_handle(handle)
+                    except Exception as e:
+                        logger.warning(
+                            "Background layer handle exception: %s", e)
+                self._background_layer_handles = remaining
+                if not self._background_layer_handles:
+                    break
+                if time.perf_counter() - drain_start > 30.0:
+                    logger.error(
+                        "Intermediate chunk drain timeout, "
+                        "%d handles remain",
+                        len(self._background_layer_handles),
+                    )
+                    for h in self._background_layer_handles:
+                        self.nixl_wrapper.release_xfer_handle(h)
+                    self._background_layer_handles = []
+                    break
+                time.sleep(0.001)
+
+        # 중간 chunk 데이터 확정 후 → 최종 chunk L: 전송.
         if self._background_layer_notif_handles:
             drain_start = time.perf_counter()
             while self._background_layer_notif_handles:
