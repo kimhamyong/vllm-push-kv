@@ -9,7 +9,7 @@ set -e
 
 # Configuration
 MODEL_NAME="meta-llama/Llama-3.2-1B"
-PROXY_URL="http://localhost:8000"
+PROXY_URL=${PROXY_URL:-http://127.0.0.1:8000}
 PREFILL_URL="http://172.31.2.19:8100"
 DECODE_URL="http://172.31.0.191:8200"
 
@@ -20,8 +20,18 @@ RESULTS_DIR="/home/ubuntu/vllm/results/${SCRIPT_NAME}"
 RESULT_FILE="${RESULTS_DIR}/${SCRIPT_NAME}_${TIMESTAMP}.json"
 NUM_PROMPTS=${NUM_PROMPTS:-10}
 OUTPUT_LEN=${OUTPUT_LEN:-200}
-SEQ_PROMPT_FILE=${SEQ_PROMPT_FILE:-/home/ubuntu/vllm/disagg_prompts/seq_24576.txt}
-CONC_PROMPT_FILE=${CONC_PROMPT_FILE:-/home/ubuntu/vllm/disagg_prompts/conc_12288.txt}
+SEQ_PROMPT_FILE=${SEQ_PROMPT_FILE:-/home/ubuntu/vllm/disagg_prompts/seq_96k.txt}
+CONC_PROMPT_FILE=${CONC_PROMPT_FILE:-/home/ubuntu/vllm/disagg_prompts/conc_48k.txt}
+SEQ_PROMPT_FILE_XL=${SEQ_PROMPT_FILE_XL:-/home/ubuntu/vllm/disagg_prompts/seq_128k.txt}
+CONC_PROMPT_FILE_XL=${CONC_PROMPT_FILE_XL:-/home/ubuntu/vllm/disagg_prompts/conc_64k.txt}
+USE_XL_PROMPTS=${USE_XL_PROMPTS:-0}
+PROMPT_TOKEN_CHECK=${PROMPT_TOKEN_CHECK:-0}
+MODEL_MAX_LEN=${MODEL_MAX_LEN:-24576}
+
+if [ "$USE_XL_PROMPTS" = "1" ]; then
+    SEQ_PROMPT_FILE="$SEQ_PROMPT_FILE_XL"
+    CONC_PROMPT_FILE="$CONC_PROMPT_FILE_XL"
+fi
 
 # Create results directory
 mkdir -p "$RESULTS_DIR"
@@ -29,12 +39,15 @@ mkdir -p "$RESULTS_DIR"
 # Export variables for Python
 export MODEL_NAME PROXY_URL PREFILL_URL DECODE_URL
 export NUM_PROMPTS OUTPUT_LEN RESULT_FILE TIMESTAMP SEQ_PROMPT_FILE CONC_PROMPT_FILE
+export PROMPT_TOKEN_CHECK MODEL_MAX_LEN
+export SEQ_PROMPT_FILE_XL CONC_PROMPT_FILE_XL USE_XL_PROMPTS
 
 echo "=============================================="
 echo "Disaggregated Prefill Benchmark"
 echo "=============================================="
 echo "Model: $MODEL_NAME"
 echo "Proxy URL: $PROXY_URL"
+echo "Prompt Files: seq=$SEQ_PROMPT_FILE conc=$CONC_PROMPT_FILE (USE_XL_PROMPTS=$USE_XL_PROMPTS)"
 echo "Result File: $RESULT_FILE"
 echo "=============================================="
 
@@ -298,20 +311,22 @@ import httpx
 from datetime import datetime
 
 # Configuration from shell
-PROXY_URL = os.environ.get("PROXY_URL", "http://localhost:8000")
+PROXY_URL = os.environ.get("PROXY_URL", "http://127.0.0.1:8000")
 MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.2-1B")
 PREFILL_URL = os.environ.get("PREFILL_URL", "http://172.31.2.19:8100")
 DECODE_URL = os.environ.get("DECODE_URL", "http://172.31.0.191:8200")
 NUM_PROMPTS = int(os.environ.get("NUM_PROMPTS", "20"))
 OUTPUT_LEN = int(os.environ.get("OUTPUT_LEN", "200"))
 SEQ_USE_BASE = os.environ.get("SEQ_USE_BASE", "0") == "1"
+PROMPT_TOKEN_CHECK = os.environ.get("PROMPT_TOKEN_CHECK", "0") == "1"
+MODEL_MAX_LEN = os.environ.get("MODEL_MAX_LEN", "24576")
 SEQ_PROMPT_FILE = os.environ.get(
     "SEQ_PROMPT_FILE",
-    "/home/ubuntu/vllm/disagg_prompts/seq_24576.txt",
+    "/home/ubuntu/vllm/disagg_prompts/seq_96k.txt",
 )
 CONC_PROMPT_FILE = os.environ.get(
     "CONC_PROMPT_FILE",
-    "/home/ubuntu/vllm/disagg_prompts/conc_12288.txt",
+    "/home/ubuntu/vllm/disagg_prompts/conc_48k.txt",
 )
 
 RESULT_FILE = os.environ.get("RESULT_FILE", "/home/ubuntu/vllm/results/benchmark_disagg/benchmark_disagg.json")
@@ -492,6 +507,36 @@ def _load_prompts(path: str, n: int):
     except Exception:
         return None
 
+def get_prompt_token_count(prompt: str):
+    if not PROMPT_TOKEN_CHECK:
+        return None, None
+    try:
+        resp = requests.post(
+            f"{PROXY_URL}/v1/completions/render",
+            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": False},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return None, None
+        data = resp.json()
+        if isinstance(data, list) and data:
+            item = data[0]
+            token_ids = item.get("prompt_token_ids")
+            if token_ids is not None:
+                prompt_tokens = len(token_ids)
+            else:
+                prompt_tokens = None
+        else:
+            prompt_tokens = None
+        remaining = None
+        if prompt_tokens is not None and MODEL_MAX_LEN:
+            try:
+                remaining = int(MODEL_MAX_LEN) - prompt_tokens
+            except ValueError:
+                remaining = None
+        return prompt_tokens, remaining
+    except Exception:
+        return None, None
 if SEQ_USE_BASE:
     benchmark_prompts = [_base_prompts[0]] * NUM_PROMPTS
     print("Using sequential prompts from: _base_prompts[0] (SEQ_USE_BASE=1)")
@@ -569,6 +614,10 @@ for i, prompt in enumerate(benchmark_prompts):
     completion_parts = []
     raw_bytes = bytearray()
     non_stream_fallback = False
+    prompt_tokens = None
+    remaining_tokens_estimate = None
+    if PROMPT_TOKEN_CHECK:
+        prompt_tokens, remaining_tokens_estimate = get_prompt_token_count(prompt)
     try:
         # Use streaming to measure REAL TTFT
         def _capture_iter(byte_iter):
@@ -699,6 +748,8 @@ for i, prompt in enumerate(benchmark_prompts):
                 "last_event_ms": round(last_event_ms, 2) if last_event_ms is not None else None,
                 "nixl_xfer_ms": round(nixl_xfer_ms, 3),
                 "nixl_bytes_kb": round(nixl_bytes_kb, 2),
+                "prompt_tokens": prompt_tokens,
+                "remaining_tokens_estimate": remaining_tokens_estimate,
                 "completion_tokens": tokens,
                 "completion_preview": "".join(completion_parts)[:120],
                 "non_stream_fallback": non_stream_fallback
@@ -815,6 +866,10 @@ def run_one_request(idx, prompt):
     valid_text = False
     usage_tokens = None
     completion_parts = []
+    prompt_tokens = None
+    remaining_tokens_estimate = None
+    if PROMPT_TOKEN_CHECK:
+        prompt_tokens, remaining_tokens_estimate = get_prompt_token_count(prompt)
     try:
         def _capture_iter(byte_iter):
             for _chunk in byte_iter:
@@ -927,6 +982,8 @@ def run_one_request(idx, prompt):
                 "last_event_ms": round(last_event_ms, 2) if last_event_ms is not None else None,
                 "nixl_xfer_ms": round(nixl_xfer_ms, 3),
                 "nixl_bytes_kb": round(nixl_bytes_kb, 2), "completion_tokens": tokens,
+                "prompt_tokens": prompt_tokens,
+                "remaining_tokens_estimate": remaining_tokens_estimate,
                 "completion_preview": "".join(completion_parts)[:120],
                 "non_stream_fallback": non_stream_fallback
             }

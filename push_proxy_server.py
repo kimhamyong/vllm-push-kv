@@ -16,8 +16,8 @@ import uuid
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse, JSONResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -164,6 +164,13 @@ async def _handle_completions(api: str, request: Request):
         logger.info(
             "[PushProxy] req=%s prefill=%s decode=%s",
             request_id, prefill_client["id"], decode_client["id"])
+        try:
+            prompt_len = len(req_data.get("prompt", "")) if isinstance(req_data, dict) else 0
+        except Exception:
+            prompt_len = 0
+        logger.info(
+            "[PushProxy] req=%s stream=%s prompt_len=%s",
+            request_id, bool(req_data.get("stream")) if isinstance(req_data, dict) else None, prompt_len)
 
         # Prefill request data (sent AFTER decode to let block alloc happen first)
         prefill_data = req_data.copy()
@@ -267,6 +274,35 @@ async def _handle_completions(api: str, request: Request):
 @app.post("/v1/completions")
 async def handle_completions(request: Request):
     return await _handle_completions("/completions", request)
+
+
+@app.post("/v1/completions/render")
+async def handle_completions_render(request: Request):
+    """Proxy render endpoint to prefill server for token count inspection."""
+    try:
+        req_data = await request.json()
+        request_id = str(uuid.uuid4())
+        prefill_client = get_next_client(request.app, "prefill")
+        headers = {
+            "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+            "X-Request-Id": request_id,
+        }
+        logger.info("[PushProxy] render req=%s prefill=%s", request_id, prefill_client["id"])
+        resp = await prefill_client["client"].post(
+            "/completions/render", json=req_data, headers=headers
+        )
+        try:
+            payload = resp.json()
+            return JSONResponse(content=payload, status_code=resp.status_code)
+        except Exception:
+            return Response(
+                content=resp.text,
+                status_code=resp.status_code,
+                media_type=resp.headers.get("content-type", "application/json"),
+            )
+    except Exception as e:
+        logger.exception("[PushProxy] render error: %s", e)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
 @app.post("/v1/chat/completions")
