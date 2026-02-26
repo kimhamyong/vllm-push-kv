@@ -2593,6 +2593,9 @@ class NixlConnectorWorker:
                             f"L:{notif_id}:{layer_idx}:{self.world_size}"
                         ).encode()
                         self.nixl_wrapper.send_notif(agent_name, notif)
+                        logger.info(
+                            "Sent L: notif req=%s layer=%d to %s",
+                            req_id, layer_idx, agent_name)
                         del layer_handles[layer_idx]
                     elif xfer_state == "SENT" and self._push_async_ack:
                         # Data copied to CPU buffer — GPU can be freed.
@@ -2629,6 +2632,8 @@ class NixlConnectorWorker:
                     f"D:{notif_id}:{self.world_size}"
                 ).encode()
                 self.nixl_wrapper.send_notif(agent_name, done_notif)
+                logger.info(
+                    "Sent D: notif req=%s to %s", req_id, agent_name)
                 del self._push_layer_transfers[req_id]
                 self._push_targets.pop(req_id, None)
 
@@ -2682,6 +2687,9 @@ class NixlConnectorWorker:
                 continue
             done_notif = f"D:{notif_id}:{self.world_size}".encode()
             self.nixl_wrapper.send_notif(agent_name, done_notif)
+            logger.info(
+                "Sent D: notif (push_done) req=%s to %s",
+                req_id, agent_name)
 
     _last_save_kv_ts: float = 0.0
 
@@ -3377,6 +3385,9 @@ class NixlConnectorWorker:
                             f"L:{notif_id}:{layer_idx}:{self.world_size}"
                         ).encode()
                         self.nixl_wrapper.send_notif(agent_name, notif)
+                        logger.info(
+                            "Sent background L: notif layer=%d to %s",
+                            layer_idx, agent_name)
                     elif xfer_state in ("PROC", "SENT"):
                         remaining_notif.append(
                             (handle, agent_name, notif_id, layer_idx))
