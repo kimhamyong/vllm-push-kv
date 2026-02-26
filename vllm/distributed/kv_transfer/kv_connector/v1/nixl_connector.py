@@ -260,6 +260,7 @@ class PushReqMeta:
     local_block_ids: list[int]
     local_physical_block_ids: list[int]
     decode_request_id: str  # Decode's request_id (key for block info lookup)
+    is_partial: bool = False  # True for intermediate chunks in chunked prefill
 
 
 class NixlConnectorMetadata(KVConnectorMetadata):
@@ -316,11 +317,13 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         request_id: ReqId,
         local_block_ids: list[int],
         kv_transfer_params: dict[str, Any],
+        is_partial: bool = False,
     ):
         self.reqs_to_push[request_id] = PushReqMeta(
             local_block_ids=local_block_ids,
             local_physical_block_ids=local_block_ids,
             decode_request_id=kv_transfer_params["decode_request_id"],
+            is_partial=is_partial,
         )
 
 
@@ -924,17 +927,27 @@ class NixlConnectorScheduler:
 
         # Push mode (Prefill): get final block IDs from scheduler_output
         # (same pattern as pull mode's _reqs_need_save above).
+        # For chunked prefill, retain in _reqs_need_push until last chunk.
         for req_id, new_block_id_groups, _ in yield_req_data(
                 scheduler_output):
             req_to_push = self._reqs_need_push.get(req_id)
             if req_to_push is None or new_block_id_groups is None:
                 continue
             assert req_to_push.kv_transfer_params is not None
+            assert scheduler_output.num_scheduled_tokens is not None
+            num_scheduled_tokens = (
+                scheduler_output.num_scheduled_tokens[req_id])
+            is_partial = (
+                req_to_push.num_computed_tokens + num_scheduled_tokens
+            ) < req_to_push.num_prompt_tokens
             meta.add_new_req_to_push(
                 request_id=req_id,
                 local_block_ids=new_block_id_groups[0],
                 kv_transfer_params=req_to_push.kv_transfer_params,
+                is_partial=is_partial,
             )
+            if not is_partial:
+                self._reqs_need_push.pop(req_id)
 
         # Push mode (Decode): proxy_req_id mapping for push recv
         meta.reqs_push_recv = self._reqs_need_push_recv
@@ -950,7 +963,8 @@ class NixlConnectorScheduler:
 
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()
-        self._reqs_need_push.clear()
+        # NOTE: _reqs_need_push is NOT cleared here; partial (chunked)
+        # prefill requests remain until the last chunk pops them above.
         self._reqs_need_push_recv = {}
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
@@ -2463,9 +2477,16 @@ class NixlConnectorWorker:
                 "local_block_ids": local_block_ids,
                 "remote_block_ids": remote_block_ids,
                 "notif_id": push_meta.decode_request_id,
+                "is_partial": push_meta.is_partial,
             }
             self._push_targets[req_id] = target
             resolved.append(req_id)
+
+            # Chunked prefill: advance remote block offset so the next
+            # chunk maps to the correct subset of decode blocks.
+            # e.g. chunk1→remote[0:128], chunk2→remote[128:256], ...
+            num_consumed = len(remote_block_ids)
+            block_info["block_ids"] = block_info["block_ids"][num_consumed:]
 
             # Catch-up WRITE for layers already computed before resolution.
             # In ALL_LAYERS mode, no per-layer catch-up needed — bulk WRITE
@@ -2546,7 +2567,9 @@ class NixlConnectorWorker:
             self.nixl_wrapper.transfer(handle)
             if write_layer_idx is not None and not self._is_all_layers_mode:
                 self._push_layer_transfers[req_id][write_layer_idx] = handle
-                if is_last_layer:
+                if is_last_layer and not target.get("is_partial"):
+                    # 마지막 레이어 + 마지막 chunk일 때만 D: 전송 허용.
+                    # 중간 chunk(is_partial=True)에서는 D: 보내면 안 됨.
                     self._push_all_layers_submitted.add(req_id)
             else:
                 self._sending_transfers[req_id].append(handle)
@@ -2637,6 +2660,7 @@ class NixlConnectorWorker:
             if (not layer_handles
                     and req_id in self._push_all_layers_submitted):
                 # All layers submitted AND completed — send D: now.
+                # (마지막 chunk에서만 _push_all_layers_submitted에 들어감)
                 done_notif = (
                     f"D:{notif_id}:{self.world_size}"
                 ).encode()
@@ -2646,6 +2670,11 @@ class NixlConnectorWorker:
                 del self._push_layer_transfers[req_id]
                 self._push_targets.pop(req_id, None)
                 self._push_all_layers_submitted.discard(req_id)
+            elif not layer_handles:
+                # 중간 chunk: 모든 레이어 WRITE 완료했지만 마지막 chunk 아님.
+                # D: 보내지 않고 정리만. (안 하면 drain에서 무한 루프)
+                del self._push_layer_transfers[req_id]
+                self._push_targets.pop(req_id, None)
 
     def _drain_push_layer_transfers(self) -> None:
         """Block until all per-layer WRITE handles reach SENT (async)
@@ -2911,7 +2940,11 @@ class NixlConnectorWorker:
         # Per-layer mode: drain remaining handles, send D: notifications.
         if self._push_layer_transfers and not self._is_all_layers_mode:
             self._drain_push_layer_transfers()
-            self._send_push_done_notifications()
+            # D: 알림은 마지막 chunk에서만 (_push_all_layers_submitted에 있을 때만).
+            # _drain_push_layer_transfers → _poll_push_layer_completions에서
+            # 이미 D: 보냈을 수 있지만, 안전장치로 한 번 더 체크.
+            if self._push_all_layers_submitted:
+                self._send_push_done_notifications()
             self._push_targets.clear()
             self._pending_push_reqs.clear()
             self._push_layer_transfers.clear()
