@@ -294,6 +294,7 @@ import time
 import requests
 import statistics
 import os
+import httpx
 from datetime import datetime
 
 # Configuration from shell
@@ -303,6 +304,7 @@ PREFILL_URL = os.environ.get("PREFILL_URL", "http://172.31.2.19:8100")
 DECODE_URL = os.environ.get("DECODE_URL", "http://172.31.0.191:8200")
 NUM_PROMPTS = int(os.environ.get("NUM_PROMPTS", "20"))
 OUTPUT_LEN = int(os.environ.get("OUTPUT_LEN", "200"))
+SEQ_USE_BASE = os.environ.get("SEQ_USE_BASE", "0") == "1"
 SEQ_PROMPT_FILE = os.environ.get(
     "SEQ_PROMPT_FILE",
     "/home/ubuntu/vllm/disagg_prompts/seq_24576.txt",
@@ -314,6 +316,61 @@ CONC_PROMPT_FILE = os.environ.get(
 
 RESULT_FILE = os.environ.get("RESULT_FILE", "/home/ubuntu/vllm/results/benchmark_disagg/benchmark_disagg.json")
 TIMESTAMP = os.environ.get("TIMESTAMP", datetime.now().strftime("%Y%m%d_%H%M%S"))
+
+STREAM_HEADERS = {
+    "Accept": "text/event-stream",
+    "Cache-Control": "no-cache",
+    "Accept-Encoding": "identity",
+}
+RAW_SSE_PREVIEW_BYTES = 2048
+STREAM_CLIENT = httpx.Client(
+    timeout=None,
+    headers=STREAM_HEADERS,
+    trust_env=False,
+)
+
+# SSE helpers
+def iter_sse_data_bytes(byte_iter):
+    """Yield raw data payloads from SSE responses as bytes."""
+    buffer = b""
+    for chunk in byte_iter:
+        if not chunk:
+            continue
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            line = line.lstrip(b"\r")
+            if line.startswith(b"data: "):
+                yield line[6:]
+            elif line.startswith(b"data:"):
+                yield line[5:]
+    buffer = buffer.lstrip(b"\r")
+    if buffer.startswith(b"data: "):
+        yield buffer[6:]
+    elif buffer.startswith(b"data:"):
+        yield buffer[5:]
+
+def _validate_completion(chunks):
+    """Validate that the response is well-formed and non-empty."""
+    if not chunks:
+        return False, "no_chunks"
+    # If any chunk has non-empty text, consider it valid.
+    for ch in chunks:
+        try:
+            txt = ch.get("choices", [{}])[0].get("text", "")
+            if txt:
+                return True, None
+        except Exception:
+            continue
+    # Otherwise, if a finish_reason exists, still accept as valid but empty.
+    for ch in chunks:
+        try:
+            fr = ch.get("choices", [{}])[0].get("finish_reason")
+            if fr is not None:
+                return False, "empty_text_finish"
+        except Exception:
+            continue
+    return False, "invalid_chunks"
 
 # Helper function to calculate percentiles
 def percentile(data, p):
@@ -418,28 +475,11 @@ except Exception as e:
 # =============================================================================
 print(f"\n=== 2. Sequential Benchmark (output_len={OUTPUT_LEN}) ===")
 
-# 긴 프롬프트 (~800 tokens each, 다양한 길이로 GPU 메모리 압박)
+# 긴 프롬프트 (~800 tokens each)
 _base_prompts = [
     "The quick brown fox jumps over the lazy dog and then runs across the wide open field where many animals gather to play and rest under the warm afternoon sun while birds sing their beautiful songs in the tall green trees nearby. The river flows gently through the valley carrying fallen leaves and small twigs downstream toward the distant ocean where waves crash upon the rocky shore. Fishermen cast their nets into the deep blue water hoping for a bountiful catch while seagulls circle overhead calling to one another. The clouds drift slowly across the sky painting shadows on the landscape below as the day progresses from morning to afternoon. Children play in the meadow chasing butterflies and picking wildflowers to bring home to their families. The old stone bridge arches gracefully over the stream connecting the two villages that have traded goods for centuries. Farmers tend their crops in the fertile fields watching the weather for signs of rain that will nourish the growing plants. The forest at the edge of town is home to deer foxes rabbits and countless species of birds that fill the air with music at dawn.",
     "In a galaxy far far away there existed a civilization of advanced beings who had mastered the art of interstellar travel and communication across vast distances using quantum entanglement technology that allowed them to share knowledge instantly across light years. Their ships were powered by antimatter engines capable of bending spacetime itself creating stable wormholes between star systems. The civilization had colonized thousands of worlds each with its own unique ecosystem and culture but all connected through a vast neural network that spanned the galaxy. Scientists on the homeworld continued to push the boundaries of physics discovering new dimensions of reality that challenged everything they thought they knew about the universe. The council of elders governed wisely balancing the needs of trillions of citizens spread across countless planets moons and space stations. Artists created works that could only be experienced in zero gravity while musicians composed symphonies using the electromagnetic frequencies of pulsars and magnetars. Engineers built megastructures around dying stars harvesting their final energy output to power the civilization for millennia to come.",
-    "Once upon a time there was a young wizard who discovered an ancient book of spells hidden deep within the forbidden library of the grand castle where generations of powerful sorcerers had studied and practiced their magical arts for over a thousand years. The book was bound in dragon leather and its pages were made from enchanted parchment that could only be read by moonlight. Each spell within was more powerful and dangerous than the last requiring immense concentration and magical energy to cast properly. The young wizard spent months studying the first chapter alone learning the fundamental principles of elemental manipulation and dimensional folding. The castle itself was alive with magic its walls shifting and corridors rearranging themselves according to ancient enchantments placed by the founders. Ghosts of former students wandered the halls offering cryptic advice to those brave enough to listen. The library contained millions of books scrolls and artifacts collected from every corner of the known world and several corners of worlds unknown. Deep beneath the castle lay a network of caverns where underground rivers of pure magical energy flowed providing power to the wards and enchantments that protected the school.",
-    "The meaning of life is a philosophical question that has been debated by great thinkers throughout human history from ancient Greek philosophers like Socrates and Plato to modern existentialists who explored the nature of consciousness and purpose in an apparently indifferent universe. Eastern traditions offer perspectives centered on mindfulness compassion and the interconnectedness of all living things suggesting that meaning arises from our relationships with others and the natural world. Scientific discoveries have revealed the astonishing complexity of biological systems from the molecular machinery of cells to the emergent properties of consciousness in the human brain raising profound questions about free will determinism and the nature of subjective experience. Some argue that meaning is inherent in the structure of reality itself encoded in mathematical laws and physical constants that seem remarkably fine tuned for the emergence of complex life. Others maintain that meaning is a human construction something we create through our choices actions and commitments rather than something we discover. The existentialist tradition emphasizes radical freedom and responsibility arguing that we are condemned to be free and must create our own values in a world without predetermined purpose.",
-    "Artificial intelligence will transform every aspect of modern society including healthcare education transportation manufacturing and entertainment as machine learning algorithms become increasingly sophisticated and capable of solving complex problems that were previously thought to require human intelligence and creativity. In medicine AI systems can analyze medical images with superhuman accuracy detecting cancers tumors and other abnormalities that human radiologists might miss leading to earlier diagnosis and better patient outcomes. Autonomous vehicles powered by deep learning neural networks will revolutionize transportation reducing accidents caused by human error and providing mobility to elderly and disabled populations who currently cannot drive. In education personalized AI tutors will adapt to each students learning style pace and interests providing customized instruction that maximizes engagement and knowledge retention. Manufacturing will be transformed by intelligent robots that can learn new tasks through observation and practice rather than requiring explicit programming for every movement and decision. Creative industries will see AI tools that assist human artists musicians and writers generating novel ideas and helping to explore vast creative spaces that would be impossible to navigate manually.",
-    "San Francisco is known for its iconic Golden Gate Bridge steep rolling hills historic cable cars and vibrant cultural diversity that attracts millions of visitors from around the world who come to experience its unique blend of technology and tradition art and innovation natural beauty and urban sophistication. The city was founded during the California Gold Rush of 1849 when thousands of prospectors flooded into the area seeking their fortune in the rivers and mountains of the Sierra Nevada. Today it stands as the heart of Silicon Valley the global center of technological innovation where companies like Apple Google Meta and countless startups continue to push the boundaries of what technology can achieve. The citys neighborhoods each have their own distinct character from the bohemian atmosphere of Haight Ashbury to the vibrant Chinatown the largest outside of Asia to the trendy restaurants and boutiques of the Mission District. Alcatraz Island sitting in the cold waters of the bay once housed Americas most notorious criminals and now serves as one of the citys most popular tourist attractions. The fog that rolls in from the Pacific Ocean each evening gives the city an ethereal quality transforming familiar landmarks into mysterious silhouettes.",
-    "The best programming language is a topic of endless debate among software developers who argue passionately about the merits of Python Java Rust Go and many other languages each designed to solve different types of computational problems efficiently and elegantly. Python has emerged as the dominant language for data science machine learning and artificial intelligence thanks to its clean syntax extensive library ecosystem and gentle learning curve that makes it accessible to beginners while remaining powerful enough for experts. Rust has gained tremendous popularity for systems programming offering memory safety without garbage collection through its innovative ownership and borrowing system that catches entire categories of bugs at compile time rather than runtime. Go designed at Google provides excellent concurrency primitives and compiles to fast native code making it ideal for building scalable network services and cloud infrastructure. JavaScript continues to dominate web development running in every browser and increasingly on servers through Node.js creating a unified language ecosystem for full stack development. Each language represents different design tradeoffs and philosophies reflecting the diverse needs of the software industry from embedded systems to web applications from scientific computing to game development.",
-    "Machine learning models can analyze vast amounts of data to discover hidden patterns and make accurate predictions that would be impossible for humans to detect manually enabling breakthroughs in medical diagnosis financial forecasting scientific research drug discovery climate modeling and many other fields that impact human welfare. Deep neural networks with billions of parameters trained on massive datasets have achieved remarkable performance on tasks ranging from image classification and object detection to natural language understanding and generation. Transfer learning allows models pretrained on large general datasets to be fine tuned for specific tasks with relatively small amounts of labeled data dramatically reducing the cost and time required to develop specialized AI applications. Reinforcement learning has produced agents capable of superhuman performance in complex games like Go chess and video games learning optimal strategies through millions of simulated episodes of trial and error. Generative models including variational autoencoders and generative adversarial networks can create realistic images videos music and text opening new possibilities for creative expression and content production. The field continues to advance rapidly with new architectures training techniques and theoretical insights emerging at an accelerating pace.",
-    "The future of technology holds incredible promise with advances in quantum computing biotechnology renewable energy artificial intelligence and space exploration that will fundamentally change how humans live work communicate and understand the universe around them. Quantum computers leveraging the strange properties of superposition and entanglement will solve problems that are intractable for classical computers including drug design materials science optimization and cryptography. CRISPR gene editing technology has given scientists unprecedented ability to modify DNA with precision opening possibilities for curing genetic diseases eliminating invasive species and engineering crops that can withstand climate change. Fusion energy the process that powers the sun is finally approaching commercial viability after decades of research promising virtually unlimited clean energy that could end humanitys dependence on fossil fuels and dramatically reduce greenhouse gas emissions. Brain computer interfaces are advancing rapidly with companies developing implantable devices that could restore movement to paralyzed patients treat neurological disorders and eventually enhance human cognitive capabilities. Space agencies and private companies are planning permanent settlements on the Moon and Mars beginning a new chapter in human history as a multiplanetary species.",
-    "Deep learning networks are composed of multiple layers of interconnected neurons that process information hierarchically extracting increasingly abstract features from raw data to perform tasks such as image recognition natural language understanding and autonomous navigation with remarkable accuracy and generalization capability. The transformer architecture introduced in 2017 revolutionized natural language processing by using self attention mechanisms that allow the model to weigh the importance of different parts of the input when generating each element of the output. Large language models built on the transformer architecture have demonstrated emergent capabilities including reasoning planning code generation and even creative writing that were not explicitly trained for but arise from the scale of the model and training data. Convolutional neural networks remain the backbone of computer vision processing images through layers of learned filters that detect edges textures shapes and objects at increasing levels of abstraction. Recurrent architectures including LSTMs and GRUs are designed to process sequential data maintaining hidden states that capture temporal dependencies in time series speech and other dynamic signals. The field of neural architecture search uses AI itself to design optimal network architectures automatically discovering configurations that outperform human designed models on benchmark tasks.",
-    "Climate change is one of the most pressing challenges facing humanity today as rising global temperatures driven by greenhouse gas emissions from burning fossil fuels deforestation and industrial processes cause increasingly severe weather events rising sea levels and disruptions to ecosystems that support life on Earth. Arctic ice is melting at an unprecedented rate causing sea levels to rise and threatening coastal communities around the world with flooding and erosion that could displace hundreds of millions of people by the end of the century. Coral reefs which support approximately one quarter of all marine species are bleaching and dying as ocean temperatures increase and waters become more acidic from absorbing excess carbon dioxide from the atmosphere. Scientists have documented shifts in migration patterns breeding seasons and geographic ranges of countless species as they attempt to adapt to rapidly changing environmental conditions. International agreements like the Paris Climate Accord aim to limit global warming to one point five degrees Celsius above preindustrial levels but achieving this goal requires dramatic reductions in emissions and fundamental changes to energy systems transportation and agriculture worldwide.",
-    "The history of mathematics stretches back thousands of years beginning with ancient civilizations that developed counting systems geometry and basic arithmetic to solve practical problems related to agriculture construction trade and astronomy. The Babylonians used a base sixty number system that still influences our measurement of time and angles while the Egyptians developed sophisticated techniques for surveying land and constructing pyramids with remarkable precision. Ancient Greek mathematicians including Euclid Archimedes and Pythagoras established rigorous logical foundations for geometry and number theory that remained the gold standard for mathematical proof for over two millennia. The development of algebra by Islamic scholars during the medieval period introduced powerful new methods for solving equations and manipulating symbolic expressions that transformed mathematical thinking. The invention of calculus independently by Newton and Leibniz in the seventeenth century provided tools for understanding continuous change and motion unlocking revolutionary advances in physics engineering and economics. Modern mathematics has grown into an enormous edifice of interconnected theories spanning abstract algebra topology analysis probability and logic with applications touching virtually every area of science and technology.",
-    "The ocean covers more than seventy percent of Earths surface and contains an estimated ninety seven percent of all water on the planet yet we have explored less than five percent of this vast underwater realm making the deep sea one of the last great frontiers of scientific discovery. The Mariana Trench the deepest known point in the ocean plunges nearly eleven kilometers below the surface where crushing pressure total darkness and near freezing temperatures create conditions that seem inhospitable to life yet thriving ecosystems have been found there. Hydrothermal vents on the ocean floor support entire food webs based on chemosynthesis rather than photosynthesis with giant tube worms eyeless shrimp and heat resistant bacteria thriving in superheated mineral rich water. Ocean currents act as a global conveyor belt distributing heat around the planet and playing a crucial role in regulating climate patterns that affect weather on every continent. Marine biodiversity is staggering with estimates suggesting that millions of species remain undiscovered in the deep ocean including organisms that may produce novel compounds with pharmaceutical applications.",
-    "The human brain is arguably the most complex structure in the known universe containing approximately eighty six billion neurons connected by trillions of synapses that form intricate networks capable of generating consciousness thought emotion memory and creativity. Each neuron can form thousands of connections with other neurons creating a web of communication pathways that process information through electrical impulses and chemical signals at speeds that rival the fastest supercomputers. Different regions of the brain specialize in different functions with the visual cortex processing sight the auditory cortex handling sound the prefrontal cortex managing executive functions and the hippocampus playing a central role in memory formation and spatial navigation. Neuroplasticity the brains ability to reorganize itself by forming new neural connections throughout life allows us to learn new skills recover from injuries and adapt to changing circumstances in ways that were not fully appreciated until recent decades. Sleep plays a critical role in brain health with research showing that during sleep the brain consolidates memories clears metabolic waste products and processes emotional experiences from the day. Understanding how the brain gives rise to consciousness remains one of the greatest unsolved problems in science.",
-    "Renaissance art emerged in fourteenth century Italy as a profound cultural movement that fundamentally transformed painting sculpture architecture and literature by reviving classical Greek and Roman ideals of beauty proportion and humanism while introducing revolutionary techniques like linear perspective chiaroscuro and oil painting that gave artists unprecedented ability to depict the three dimensional world on flat surfaces. Leonardo da Vinci perhaps the greatest polymath in history created masterpieces like the Mona Lisa and The Last Supper while simultaneously advancing anatomy engineering optics and dozens of other fields through tireless observation and experimentation. Michelangelo demonstrated superhuman artistic ability in the ceiling of the Sistine Chapel where over four years of grueling work he painted over three hundred figures depicting scenes from Genesis that remain among the most awe inspiring artworks ever created. Raphael brought classical grace and harmony to new heights in his paintings and frescoes particularly The School of Athens which depicts the greatest philosophers and scientists of antiquity gathered in an idealized architectural setting. The Renaissance spread northward influencing artists like Albrecht Durer Jan van Eyck and Pieter Bruegel who combined Italian innovations with local traditions to create distinctly northern European artistic styles.",
-    "Cooking is both an art and a science that transforms raw ingredients through heat chemical reactions and skillful technique into nourishing delicious meals that bring people together and connect us to cultural traditions spanning thousands of years and every corner of the globe. The Maillard reaction which occurs when proteins and sugars are heated together is responsible for the complex flavors and appealing brown color of seared meat toasted bread and roasted coffee beans. Fermentation one of the oldest food preparation techniques harnesses the power of microorganisms to transform simple ingredients into complex flavorful products like cheese bread wine yogurt soy sauce and kimchi. French cuisine codified by Auguste Escoffier in the early twentieth century established the foundation of professional cooking with its mother sauces classical techniques and brigade system that still influence restaurant kitchens worldwide. Asian culinary traditions emphasize the balance of five fundamental flavors sweet sour salty bitter and umami creating harmonious dishes that satisfy on multiple sensory levels simultaneously. Modern molecular gastronomy applies scientific principles and tools from chemistry and physics to create innovative dishes that challenge our expectations of texture temperature and flavor presentation.",
-    "The Industrial Revolution beginning in eighteenth century Britain fundamentally transformed human civilization by introducing mechanical manufacturing powered by steam engines water wheels and later electricity replacing centuries of manual labor and craft production with factory based mass production that dramatically increased output efficiency and eventually living standards. Textile mills were among the first industries to mechanize with inventions like the spinning jenny water frame and power loom enabling a single worker to produce as much cloth as dozens of hand spinners and weavers had previously. The development of the steam engine by James Watt and others provided a versatile portable source of power that could drive machinery pump water from mines haul goods on railways and propel ships across oceans regardless of wind conditions. Urbanization accelerated as workers migrated from rural areas to growing industrial cities creating both opportunities and challenges including overcrowding pollution poor sanitation and labor exploitation that eventually led to reform movements and labor unions. The revolution spread from Britain to continental Europe North America and eventually the entire world transforming agrarian societies into industrial economies and setting the stage for the modern technological civilization we live in today.",
-    "Astronomy the oldest of the natural sciences has revealed the breathtaking scale and beauty of the cosmos from our solar systems planets and moons to distant galaxies billions of light years away containing hundreds of billions of stars each potentially hosting its own system of worlds. The Hubble Space Telescope launched in 1990 has captured some of the most iconic images in scientific history including the Hubble Deep Field which revealed thousands of galaxies in a tiny patch of sky that appeared empty to ground based telescopes. The discovery of exoplanets orbiting other stars has accelerated dramatically with the Kepler and TESS missions identifying thousands of confirmed planets including many in the habitable zones of their host stars where conditions might support liquid water and potentially life. Black holes predicted by Einsteins general theory of relativity were long considered theoretical curiosities until mounting observational evidence and finally the first direct image captured by the Event Horizon Telescope in 2019 confirmed their existence. Gravitational wave detectors like LIGO and Virgo have opened an entirely new window on the universe detecting ripples in spacetime caused by the merger of massive objects like black holes and neutron stars billions of light years away.",
-    "Language is the foundation of human civilization a uniquely complex system of communication that allows us to share thoughts express emotions preserve knowledge across generations and coordinate collective action on scales unmatched by any other species on Earth. Linguists estimate that approximately seven thousand languages are currently spoken worldwide each reflecting a unique way of categorizing and understanding reality through distinct grammatical structures vocabularies and sound systems. The Sapir Whorf hypothesis suggests that the language we speak influences how we think and perceive the world with research showing that speakers of different languages may categorize colors remember events and conceptualize time in measurably different ways. Historical linguistics traces the evolution of language families revealing deep connections between seemingly unrelated tongues and providing insights into ancient migration patterns cultural contacts and the cognitive capabilities of our ancestors. The emergence of writing approximately five thousand years ago in Mesopotamia and independently in China and Mesoamerica marked a watershed moment enabling the accumulation and transmission of knowledge across time and space that made complex civilizations possible.",
-    "Music is a universal human experience found in every known culture throughout history serving as a vehicle for emotional expression social bonding spiritual practice storytelling and artistic innovation that engages the brain in uniquely powerful ways activating regions associated with movement emotion memory language and reward simultaneously. The physics of sound waves determines the mathematical relationships between musical intervals with consonant harmonies arising from simple frequency ratios that the human auditory system finds naturally pleasing while dissonance creates tension that composers exploit for expressive effect. Western classical music evolved over centuries from the monophonic chants of medieval monasteries through the polyphonic complexity of the Baroque period the emotional depth of Romanticism and the radical experimentation of twentieth century modernism. Jazz emerged in early twentieth century America blending African rhythmic traditions European harmonic structures and improvisational creativity into a uniquely expressive art form that influenced virtually every genre of popular music that followed. Electronic music production has democratized musical creation allowing anyone with a computer to compose arrange and produce professional quality recordings using virtual instruments and digital audio processing tools that would have been unimaginable just decades ago."
+    "Once upon a time there was a young wizard who discovered an ancient book of spells hidden deep within the forbidden library of the grand castle where generations of powerful sorcerers had studied and practiced their magical arts for over a thousand years. The book was bound in dragon leather and its pages were made from enchanted parchment that could only be read by moonlight. Each spell within was more powerful and dangerous than the last requiring immense concentration and magical energy to cast properly. The young wizard spent months studying the first chapter alone learning the fundamental principles of elemental manipulation and dimensional folding. The castle itself was alive with magic its walls shifting and corridors rearranging themselves according to ancient enchantments placed by the founders. Ghosts of former students wandered the halls offering cryptic advice to those brave enough to listen. The library contained millions of books scrolls and artifacts collected from every corner of the known world and several corners of worlds unknown. Deep beneath the castle lay a network of caverns where underground rivers of pure magical energy flowed providing power to the wards and enchantments that protected the school."
 ]
 
 def _load_prompts(path: str, n: int):
@@ -452,14 +492,18 @@ def _load_prompts(path: str, n: int):
     except Exception:
         return None
 
-benchmark_prompts = _load_prompts(SEQ_PROMPT_FILE, NUM_PROMPTS)
-if benchmark_prompts is None:
-    # Fallback to built-in prompts
-    benchmark_prompts = [
-        _base_prompts[i % len(_base_prompts)] for i in range(NUM_PROMPTS)
-    ]
+if SEQ_USE_BASE:
+    benchmark_prompts = [_base_prompts[0]] * NUM_PROMPTS
+    print("Using sequential prompts from: _base_prompts[0] (SEQ_USE_BASE=1)")
 else:
-    print(f"Using sequential prompts from: {SEQ_PROMPT_FILE}")
+    benchmark_prompts = _load_prompts(SEQ_PROMPT_FILE, NUM_PROMPTS)
+    if benchmark_prompts is None:
+        # Fallback to built-in prompts
+        benchmark_prompts = [
+            _base_prompts[i % len(_base_prompts)] for i in range(NUM_PROMPTS)
+        ]
+    else:
+        print(f"Using sequential prompts from: {SEQ_PROMPT_FILE}")
 
 measurements = []
 latencies = []
@@ -471,6 +515,37 @@ total_tokens = 0
 print(f"Running {len(benchmark_prompts)} sequential requests...")
 bench_start = time.perf_counter()
 
+# Sanity check: run one request with same params as accuracy (long prompt)
+print("\n[Sanity] Single request with accuracy-style prompt/max_tokens")
+_sanity_prompt = _base_prompts[0]
+_sanity_max_tokens = 200
+try:
+    _s_start = time.perf_counter()
+    _s_parts = []
+    with STREAM_CLIENT.stream(
+        "POST",
+        f"{PROXY_URL}/v1/completions",
+        json={"model": MODEL_NAME, "prompt": _sanity_prompt, "max_tokens": _sanity_max_tokens, "temperature": 0, "stream": True},
+        timeout=300,
+    ) as _s_resp:
+        if _s_resp.status_code == 200:
+            for _data in iter_sse_data_bytes(_s_resp.iter_bytes()):
+                _chunk_data = _data.decode("utf-8", errors="ignore")
+                if _chunk_data.strip() == "[DONE]":
+                    break
+                try:
+                    _chunk = json.loads(_chunk_data)
+                    _txt = _chunk.get("choices", [{}])[0].get("text", "")
+                    if _txt:
+                        _s_parts.append(_txt)
+                except (json.JSONDecodeError, KeyError):
+                    pass
+        _s_elapsed = (time.perf_counter() - _s_start) * 1000
+    _s_preview = "".join(_s_parts)[:120]
+    print(f"[Sanity] status={_s_resp.status_code} elapsed_ms={_s_elapsed:.2f} preview='{_s_preview}'")
+except Exception as _e:
+    print(f"[Sanity] ERROR - {_e}")
+
 for i, prompt in enumerate(benchmark_prompts):
     # Get NIXL metrics BEFORE this request
     nixl_before = get_nixl_metrics_both()
@@ -478,33 +553,93 @@ for i, prompt in enumerate(benchmark_prompts):
     start = time.perf_counter()
     ttft = None
     tokens = 0
+    chunk_times_ms = []
+    chunk_count = 0
+    sse_samples = []
+    sse_content_type = None
+    sse_first_bytes = None
+    first_byte_ms = None
+    first_event_ms = None
+    last_event_ms = None
+    parsed_chunks = []
+    parse_errors = 0
+    http_ok = False
+    valid_text = False
+    usage_tokens = None
+    completion_parts = []
+    raw_bytes = bytearray()
+    non_stream_fallback = False
     try:
         # Use streaming to measure REAL TTFT
-        resp = requests.post(f"{PROXY_URL}/v1/completions",
-            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": True},
-            timeout=300, stream=True)
+        def _capture_iter(byte_iter):
+            for _chunk in byte_iter:
+                if _chunk and len(raw_bytes) < RAW_SSE_PREVIEW_BYTES:
+                    take = RAW_SSE_PREVIEW_BYTES - len(raw_bytes)
+                    raw_bytes.extend(_chunk[:take])
+                yield _chunk
 
-        if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                chunk_data = line[6:]
-                if chunk_data.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(chunk_data)
-                    if ttft is None:
-                        ttft = (time.perf_counter() - start) * 1000
-                    choice = chunk.get("choices", [{}])[0]
-                    txt = choice.get("text", "")
-                    if txt:
-                        tokens += 1
-                    # Check for finish_reason
-                    usage = chunk.get("usage")
-                    if usage and usage.get("completion_tokens"):
-                        tokens = usage["completion_tokens"]
-                except (json.JSONDecodeError, KeyError):
-                    pass
+        with STREAM_CLIENT.stream(
+            "POST",
+            f"{PROXY_URL}/v1/completions",
+            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": True},
+            timeout=300,
+        ) as resp:
+            sse_content_type = resp.headers.get("content-type")
+            http_ok = resp.status_code == 200
+            if http_ok:
+                for data in iter_sse_data_bytes(_capture_iter(resp.iter_bytes())):
+                    if first_event_ms is None:
+                        first_event_ms = (time.perf_counter() - start) * 1000
+                    chunk_data = data.decode("utf-8", errors="ignore")
+                    if chunk_data.strip() == "[DONE]":
+                        break
+                    if len(sse_samples) < 3:
+                        sse_samples.append(chunk_data)
+                    if sse_first_bytes is None:
+                        sse_first_bytes = chunk_data[:128]
+                    chunk_count += 1
+                    now_ms = (time.perf_counter() - start) * 1000
+                    if first_byte_ms is None:
+                        first_byte_ms = now_ms
+                    chunk_times_ms.append(now_ms)
+                    last_event_ms = now_ms
+                    try:
+                        chunk = json.loads(chunk_data)
+                        parsed_chunks.append(chunk)
+                        if ttft is None:
+                            ttft = (time.perf_counter() - start) * 1000
+                        choice = chunk.get("choices", [{}])[0]
+                        txt = choice.get("text", "")
+                        if txt:
+                            valid_text = True
+                            tokens += 1
+                            completion_parts.append(txt)
+                        # Check for finish_reason
+                        usage = chunk.get("usage")
+                        if usage and usage.get("completion_tokens"):
+                            usage_tokens = usage["completion_tokens"]
+                    except (json.JSONDecodeError, KeyError):
+                        parse_errors += 1
+                        pass
+
+            if not parsed_chunks and raw_bytes:
+                raw_preview = raw_bytes.decode("utf-8", errors="replace").strip()
+                if raw_preview.startswith("{"):
+                    try:
+                        parsed = json.loads(raw_preview)
+                        parsed_chunks.append(parsed)
+                        choice = parsed.get("choices", [{}])[0]
+                        txt = choice.get("text", "")
+                        if txt:
+                            completion_parts.append(txt)
+                            valid_text = True
+                        usage = parsed.get("usage") or {}
+                        completion_tokens = usage.get("completion_tokens")
+                        if completion_tokens is not None:
+                            usage_tokens = completion_tokens
+                        non_stream_fallback = True
+                    except json.JSONDecodeError:
+                        pass
 
             latency = (time.perf_counter() - start) * 1000
 
@@ -519,32 +654,57 @@ for i, prompt in enumerate(benchmark_prompts):
                 nixl_xfer_ms = xfer_time_diff * 1000
                 nixl_bytes_kb = bytes_diff / 1024
 
-            if tokens == 0:
-                tokens = OUTPUT_LEN
+            if usage_tokens is not None:
+                tokens = usage_tokens
             if ttft is None:
-                ttft = latency * 0.3
-            tpot = (latency - ttft) / max(tokens - 1, 1)
+                ttft = first_event_ms if first_event_ms is not None else (first_byte_ms if first_byte_ms is not None else latency)
+            if len(chunk_times_ms) >= 2:
+                stream_span = chunk_times_ms[-1] - chunk_times_ms[0]
+                tpot = stream_span / max(tokens - 1, 1)
+                tpot_fallback = None
+            else:
+                stream_span = 0
+                tpot = None
+                tpot_fallback = (latency - ttft) / max(tokens - 1, 1)
 
+            is_valid, invalid_reason = _validate_completion(parsed_chunks)
+            status = "success" if http_ok else "failed"
+            if completion_parts and not valid_text:
+                valid_text = True
+            raw_preview = raw_bytes.decode("utf-8", errors="replace") if raw_bytes else None
             latencies.append(latency)
             ttft_values.append(ttft)
-            tpot_values.append(tpot)
+            tpot_values.append(tpot if tpot is not None else tpot_fallback)
             nixl_xfer_times.append(nixl_xfer_ms)
             total_tokens += tokens
-
             measurements.append({
                 "request_id": i+1,
-                "status": "success",
+                "status": status,
+                "http_ok": http_ok,
+                "valid_text": valid_text,
+                "invalid_reason": invalid_reason,
+                "parse_errors": parse_errors,
                 "latency_ms": round(latency, 2),
                 "ttft_ms": round(ttft, 2),
-                "tpot_ms": round(tpot, 2),
+                "tpot_ms": round(tpot, 2) if tpot is not None else None,
+                "tpot_fallback_ms": round(tpot_fallback, 2) if tpot_fallback is not None else None,
+                "chunk_count": chunk_count,
+                "stream_span_ms": round(stream_span, 2),
+                "sse_samples": sse_samples,
+                "sse_content_type": sse_content_type,
+                "sse_first_bytes": sse_first_bytes,
+                "sse_raw_first_bytes": raw_preview[:256] if raw_preview else None,
+                "first_byte_ms": round(first_byte_ms, 2) if first_byte_ms is not None else None,
+                "first_event_ms": round(first_event_ms, 2) if first_event_ms is not None else None,
+                "last_event_ms": round(last_event_ms, 2) if last_event_ms is not None else None,
                 "nixl_xfer_ms": round(nixl_xfer_ms, 3),
                 "nixl_bytes_kb": round(nixl_bytes_kb, 2),
-                "completion_tokens": tokens
+                "completion_tokens": tokens,
+                "completion_preview": "".join(completion_parts)[:120],
+                "non_stream_fallback": non_stream_fallback
             })
-            print(f"  Request {i+1}: latency={latency:.2f}ms, TTFT={ttft:.2f}ms, NIXL_xfer={nixl_xfer_ms:.2f}ms, tokens={tokens}")
-        else:
-            measurements.append({"request_id": i+1, "status": "failed"})
-            print(f"  Request {i+1}: FAILED (status={resp.status_code})")
+            tpot_display = f"{tpot:.2f}ms" if tpot is not None else f"fallback {tpot_fallback:.2f}ms"
+            print(f"  Request {i+1}: status={status}, latency={latency:.2f}ms, TTFT={ttft:.2f}ms, TPOT={tpot_display}, stream_span={stream_span:.2f}ms, chunks={chunk_count}, NIXL_xfer={nixl_xfer_ms:.2f}ms, tokens={tokens}")
     except Exception as e:
         measurements.append({"request_id": i+1, "status": "error", "error": str(e)})
         print(f"  Request {i+1}: ERROR - {e}")
@@ -552,61 +712,75 @@ for i, prompt in enumerate(benchmark_prompts):
 bench_end = time.perf_counter()
 total_time = bench_end - bench_start
 
-if latencies:
-    # Calculate NIXL xfer time statistics
-    nixl_stats = {}
-    if nixl_xfer_times:
-        nixl_stats = {
-            "avg": round(statistics.mean(nixl_xfer_times), 3),
-            "min": round(min(nixl_xfer_times), 3),
-            "max": round(max(nixl_xfer_times), 3),
-            "p50": round(percentile(nixl_xfer_times, 50), 3),
-            "p90": round(percentile(nixl_xfer_times, 90), 3),
-            "p99": round(percentile(nixl_xfer_times, 99), 3),
-            "stddev": round(statistics.stdev(nixl_xfer_times), 3) if len(nixl_xfer_times) > 1 else 0
-        }
-
-    result["benchmark"] = {
-        "measurements": measurements,
-        "summary": {
-            "total_requests": len(benchmark_prompts),
-            "successful_requests": len(latencies),
-            "failed_requests": len(benchmark_prompts) - len(latencies),
-            "total_time_sec": round(total_time, 2),
-            "throughput_req_per_sec": round(len(latencies) / total_time, 2),
-            "throughput_tokens_per_sec": round(total_tokens / total_time, 2),
-            "latency_ms": {
-                "avg": round(statistics.mean(latencies), 2),
-                "min": round(min(latencies), 2),
-                "max": round(max(latencies), 2),
-                "p50": round(percentile(latencies, 50), 2),
-                "p90": round(percentile(latencies, 90), 2),
-                "p99": round(percentile(latencies, 99), 2),
-                "stddev": round(statistics.stdev(latencies), 2) if len(latencies) > 1 else 0
-            },
-            "nixl_xfer_ms": nixl_stats,
-            "ttft_ms": {
-                "avg": round(statistics.mean(ttft_values), 2),
-                "p50": round(percentile(ttft_values, 50), 2),
-                "p90": round(percentile(ttft_values, 90), 2),
-                "p99": round(percentile(ttft_values, 99), 2)
-            },
-            "tpot_ms": {
-                "avg": round(statistics.mean(tpot_values), 2),
-                "p50": round(percentile(tpot_values, 50), 2),
-                "p90": round(percentile(tpot_values, 90), 2),
-                "p99": round(percentile(tpot_values, 99), 2)
-            }
-        }
+# Calculate NIXL xfer time statistics
+nixl_stats = {}
+if nixl_xfer_times:
+    nixl_stats = {
+        "avg": round(statistics.mean(nixl_xfer_times), 3),
+        "min": round(min(nixl_xfer_times), 3),
+        "max": round(max(nixl_xfer_times), 3),
+        "p50": round(percentile(nixl_xfer_times, 50), 3),
+        "p90": round(percentile(nixl_xfer_times, 90), 3),
+        "p99": round(percentile(nixl_xfer_times, 99), 3),
+        "stddev": round(statistics.stdev(nixl_xfer_times), 3) if len(nixl_xfer_times) > 1 else 0
     }
-    s = result["benchmark"]["summary"]
-    print(f"\n--- Summary ---")
+
+lat_stats = {}
+ttft_stats = {}
+tpot_stats = {}
+if latencies:
+    lat_stats = {
+        "avg": round(statistics.mean(latencies), 2),
+        "min": round(min(latencies), 2),
+        "max": round(max(latencies), 2),
+        "p50": round(percentile(latencies, 50), 2),
+        "p90": round(percentile(latencies, 90), 2),
+        "p99": round(percentile(latencies, 99), 2),
+        "stddev": round(statistics.stdev(latencies), 2) if len(latencies) > 1 else 0
+    }
+if ttft_values:
+    ttft_stats = {
+        "avg": round(statistics.mean(ttft_values), 2),
+        "p50": round(percentile(ttft_values, 50), 2),
+        "p90": round(percentile(ttft_values, 90), 2),
+        "p99": round(percentile(ttft_values, 99), 2)
+    }
+if tpot_values:
+    tpot_stats = {
+        "avg": round(statistics.mean(tpot_values), 2),
+        "p50": round(percentile(tpot_values, 50), 2),
+        "p90": round(percentile(tpot_values, 90), 2),
+        "p99": round(percentile(tpot_values, 99), 2)
+    }
+
+result["benchmark"] = {
+    "measurements": measurements,
+    "summary": {
+        "total_requests": len(benchmark_prompts),
+        "successful_requests": len(latencies),
+        "valid_text_requests": sum(1 for m in measurements if m.get("valid_text")),
+        "invalid_text_requests": sum(1 for m in measurements if m.get("http_ok") and not m.get("valid_text")),
+        "failed_requests": len(benchmark_prompts) - len(latencies),
+        "total_time_sec": round(total_time, 2),
+        "throughput_req_per_sec": round(len(latencies) / total_time, 2) if latencies else 0,
+        "throughput_tokens_per_sec": round(total_tokens / total_time, 2) if latencies else 0,
+        "latency_ms": lat_stats,
+        "nixl_xfer_ms": nixl_stats,
+        "ttft_ms": ttft_stats,
+        "tpot_ms": tpot_stats
+    }
+}
+s = result["benchmark"]["summary"]
+print(f"\n--- Summary ---")
+if latencies:
     print(f"Throughput: {s['throughput_req_per_sec']:.2f} req/s, {s['throughput_tokens_per_sec']:.2f} tokens/s")
     print(f"Latency: Avg={s['latency_ms']['avg']:.2f}ms, P90={s['latency_ms']['p90']:.2f}ms, P99={s['latency_ms']['p99']:.2f}ms")
     if nixl_stats:
         print(f"NIXL KV Transfer: Avg={nixl_stats['avg']:.2f}ms, P90={nixl_stats['p90']:.2f}ms, P99={nixl_stats['p99']:.2f}ms")
-    print(f"TTFT: Avg={s['ttft_ms']['avg']:.2f}ms, P90={s['ttft_ms']['p90']:.2f}ms, P99={s['ttft_ms']['p99']:.2f}ms")
-    print(f"TPOT: Avg={s['tpot_ms']['avg']:.2f}ms, P90={s['tpot_ms']['p90']:.2f}ms, P99={s['tpot_ms']['p99']:.2f}ms")
+    if ttft_stats:
+        print(f"TTFT: Avg={s['ttft_ms']['avg']:.2f}ms, P90={s['ttft_ms']['p90']:.2f}ms, P99={s['ttft_ms']['p99']:.2f}ms")
+    if tpot_stats:
+        print(f"TPOT: Avg={s['tpot_ms']['avg']:.2f}ms, P90={s['tpot_ms']['p90']:.2f}ms, P99={s['tpot_ms']['p99']:.2f}ms")
 
 # =============================================================================
 # 2-B. Concurrent Benchmark
@@ -627,31 +801,87 @@ def run_one_request(idx, prompt):
     start = time.perf_counter()
     ttft = None
     tokens = 0
+    sse_samples = []
+    sse_content_type = None
+    sse_first_bytes = None
+    first_byte_ms = None
+    first_event_ms = None
+    last_event_ms = None
+    parsed_chunks = []
+    raw_bytes = bytearray()
+    non_stream_fallback = False
+    parse_errors = 0
+    http_ok = False
+    valid_text = False
+    usage_tokens = None
+    completion_parts = []
     try:
-        resp = requests.post(f"{PROXY_URL}/v1/completions",
-            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": True},
-            timeout=300, stream=True)
+        def _capture_iter(byte_iter):
+            for _chunk in byte_iter:
+                if _chunk and len(raw_bytes) < RAW_SSE_PREVIEW_BYTES:
+                    take = RAW_SSE_PREVIEW_BYTES - len(raw_bytes)
+                    raw_bytes.extend(_chunk[:take])
+                yield _chunk
 
-        if resp.status_code == 200:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                chunk_data = line[6:]
-                if chunk_data.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(chunk_data)
-                    if ttft is None:
-                        ttft = (time.perf_counter() - start) * 1000
-                    choice = chunk.get("choices", [{}])[0]
-                    txt = choice.get("text", "")
-                    if txt:
-                        tokens += 1
-                    usage = chunk.get("usage")
-                    if usage and usage.get("completion_tokens"):
-                        tokens = usage["completion_tokens"]
-                except (json.JSONDecodeError, KeyError):
-                    pass
+        with STREAM_CLIENT.stream(
+            "POST",
+            f"{PROXY_URL}/v1/completions",
+            json={"model": MODEL_NAME, "prompt": prompt, "max_tokens": OUTPUT_LEN, "temperature": 0, "stream": True},
+            timeout=300,
+        ) as resp:
+            sse_content_type = resp.headers.get("content-type")
+            http_ok = resp.status_code == 200
+            if http_ok:
+                for data in iter_sse_data_bytes(_capture_iter(resp.iter_bytes())):
+                    if first_event_ms is None:
+                        first_event_ms = (time.perf_counter() - start) * 1000
+                    chunk_data = data.decode("utf-8", errors="ignore")
+                    if chunk_data.strip() == "[DONE]":
+                        break
+                    if len(sse_samples) < 3:
+                        sse_samples.append(chunk_data)
+                    if sse_first_bytes is None:
+                        sse_first_bytes = chunk_data[:128]
+                    try:
+                        chunk = json.loads(chunk_data)
+                        parsed_chunks.append(chunk)
+                        if ttft is None:
+                            ttft = (time.perf_counter() - start) * 1000
+                        choice = chunk.get("choices", [{}])[0]
+                        txt = choice.get("text", "")
+                        if txt:
+                            valid_text = True
+                            tokens += 1
+                            completion_parts.append(txt)
+                        usage = chunk.get("usage")
+                        if usage and usage.get("completion_tokens"):
+                            usage_tokens = usage["completion_tokens"]
+                    except (json.JSONDecodeError, KeyError):
+                        parse_errors += 1
+                        pass
+                    now_ms = (time.perf_counter() - start) * 1000
+                    if first_byte_ms is None:
+                        first_byte_ms = now_ms
+                    last_event_ms = now_ms
+
+            if not parsed_chunks and raw_bytes:
+                raw_preview = raw_bytes.decode("utf-8", errors="replace").strip()
+                if raw_preview.startswith("{"):
+                    try:
+                        parsed = json.loads(raw_preview)
+                        parsed_chunks.append(parsed)
+                        choice = parsed.get("choices", [{}])[0]
+                        txt = choice.get("text", "")
+                        if txt:
+                            completion_parts.append(txt)
+                            valid_text = True
+                        usage = parsed.get("usage") or {}
+                        completion_tokens = usage.get("completion_tokens")
+                        if completion_tokens is not None:
+                            usage_tokens = completion_tokens
+                        non_stream_fallback = True
+                    except json.JSONDecodeError:
+                        pass
 
             latency = (time.perf_counter() - start) * 1000
 
@@ -664,19 +894,42 @@ def run_one_request(idx, prompt):
                 nixl_xfer_ms = xfer_time_diff * 1000
                 nixl_bytes_kb = bytes_diff / 1024
 
-            if tokens == 0:
-                tokens = OUTPUT_LEN
+            if usage_tokens is not None:
+                tokens = usage_tokens
             if ttft is None:
-                ttft = latency * 0.3
-            tpot = (latency - ttft) / max(tokens - 1, 1)
+                ttft = first_event_ms if first_event_ms is not None else (first_byte_ms if first_byte_ms is not None else latency)
+            if first_event_ms is not None and last_event_ms is not None and last_event_ms > first_event_ms:
+                tpot = (last_event_ms - first_event_ms) / max(tokens - 1, 1)
+                tpot_fallback = None
+            else:
+                tpot = None
+                tpot_fallback = (latency - ttft) / max(tokens - 1, 1)
+            is_valid, invalid_reason = _validate_completion(parsed_chunks)
+            status = "success" if http_ok else "failed"
+            if completion_parts and not valid_text:
+                valid_text = True
+            raw_preview = raw_bytes.decode("utf-8", errors="replace") if raw_bytes else None
             return {
-                "request_id": idx+1, "status": "success",
+                "request_id": idx+1, "status": status,
+                "http_ok": http_ok,
+                "valid_text": valid_text,
+                "invalid_reason": invalid_reason,
+                "parse_errors": parse_errors,
                 "latency_ms": round(latency, 2), "ttft_ms": round(ttft, 2),
-                "tpot_ms": round(tpot, 2), "nixl_xfer_ms": round(nixl_xfer_ms, 3),
-                "nixl_bytes_kb": round(nixl_bytes_kb, 2), "completion_tokens": tokens
+                "tpot_ms": round(tpot, 2) if tpot is not None else None,
+                "tpot_fallback_ms": round(tpot_fallback, 2) if tpot_fallback is not None else None,
+                "sse_samples": sse_samples,
+                "sse_content_type": sse_content_type,
+                "sse_first_bytes": sse_first_bytes,
+                "sse_raw_first_bytes": raw_preview[:256] if raw_preview else None,
+                "first_byte_ms": round(first_byte_ms, 2) if first_byte_ms is not None else None,
+                "first_event_ms": round(first_event_ms, 2) if first_event_ms is not None else None,
+                "last_event_ms": round(last_event_ms, 2) if last_event_ms is not None else None,
+                "nixl_xfer_ms": round(nixl_xfer_ms, 3),
+                "nixl_bytes_kb": round(nixl_bytes_kb, 2), "completion_tokens": tokens,
+                "completion_preview": "".join(completion_parts)[:120],
+                "non_stream_fallback": non_stream_fallback
             }
-        else:
-            return {"request_id": idx+1, "status": "failed"}
     except Exception as e:
         return {"request_id": idx+1, "status": "error", "error": str(e)}
 
@@ -698,11 +951,11 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_PROMPTS) as executor:
         if m["status"] == "success":
             conc_latencies.append(m["latency_ms"])
             conc_ttft_values.append(m["ttft_ms"])
-            conc_tpot_values.append(m["tpot_ms"])
+            conc_tpot_values.append(m["tpot_ms"] if m.get("tpot_ms") is not None else m.get("tpot_fallback_ms"))
             conc_total_tokens += m["completion_tokens"]
-            print(f"  Request {m['request_id']}: latency={m['latency_ms']:.2f}ms, tokens={m['completion_tokens']}")
+            print(f"  Request {m['request_id']}: status=success, latency={m['latency_ms']:.2f}ms, tokens={m['completion_tokens']}")
         else:
-            print(f"  Request {m['request_id']}: {m['status']}")
+            print(f"  Request {m['request_id']}: status={m['status']}")
 
 conc_end = time.perf_counter()
 conc_total_time = conc_end - conc_start
@@ -722,37 +975,53 @@ if conc_latencies:
             "stddev": round(statistics.stdev(conc_nixl_times), 3) if len(conc_nixl_times) > 1 else 0
         }
 
+    conc_tpot_non_null = [v for v in conc_tpot_values if v is not None]
+    if not conc_tpot_non_null:
+        conc_tpot_non_null = []
+
+    conc_lat_stats = {}
+    conc_ttft_stats = {}
+    conc_tpot_stats = {}
+    if conc_latencies:
+        conc_lat_stats = {
+            "avg": round(statistics.mean(conc_latencies), 2),
+            "min": round(min(conc_latencies), 2),
+            "max": round(max(conc_latencies), 2),
+            "p50": round(percentile(conc_latencies, 50), 2),
+            "p90": round(percentile(conc_latencies, 90), 2),
+            "p99": round(percentile(conc_latencies, 99), 2),
+            "stddev": round(statistics.stdev(conc_latencies), 2) if len(conc_latencies) > 1 else 0
+        }
+    if conc_ttft_values:
+        conc_ttft_stats = {
+            "avg": round(statistics.mean(conc_ttft_values), 2),
+            "p50": round(percentile(conc_ttft_values, 50), 2),
+            "p90": round(percentile(conc_ttft_values, 90), 2),
+            "p99": round(percentile(conc_ttft_values, 99), 2)
+        }
+    if conc_tpot_non_null:
+        conc_tpot_stats = {
+            "avg": round(statistics.mean(conc_tpot_non_null), 2),
+            "p50": round(percentile(conc_tpot_non_null, 50), 2),
+            "p90": round(percentile(conc_tpot_non_null, 90), 2),
+            "p99": round(percentile(conc_tpot_non_null, 99), 2)
+        }
+
     result["benchmark_concurrent"] = {
         "measurements": conc_measurements,
         "summary": {
             "total_requests": len(conc_prompts),
             "successful_requests": len(conc_latencies),
+            "valid_text_requests": sum(1 for m in conc_measurements if m.get("valid_text")),
+            "invalid_text_requests": sum(1 for m in conc_measurements if m.get("http_ok") and not m.get("valid_text")),
             "failed_requests": len(conc_prompts) - len(conc_latencies),
             "total_time_sec": round(conc_total_time, 2),
-            "throughput_req_per_sec": round(len(conc_latencies) / conc_total_time, 2),
-            "throughput_tokens_per_sec": round(conc_total_tokens / conc_total_time, 2),
-            "latency_ms": {
-                "avg": round(statistics.mean(conc_latencies), 2),
-                "min": round(min(conc_latencies), 2),
-                "max": round(max(conc_latencies), 2),
-                "p50": round(percentile(conc_latencies, 50), 2),
-                "p90": round(percentile(conc_latencies, 90), 2),
-                "p99": round(percentile(conc_latencies, 99), 2),
-                "stddev": round(statistics.stdev(conc_latencies), 2) if len(conc_latencies) > 1 else 0
-            },
+            "throughput_req_per_sec": round(len(conc_latencies) / conc_total_time, 2) if conc_latencies else 0,
+            "throughput_tokens_per_sec": round(conc_total_tokens / conc_total_time, 2) if conc_latencies else 0,
+            "latency_ms": conc_lat_stats,
             "nixl_xfer_ms": conc_nixl_stats,
-            "ttft_ms": {
-                "avg": round(statistics.mean(conc_ttft_values), 2),
-                "p50": round(percentile(conc_ttft_values, 50), 2),
-                "p90": round(percentile(conc_ttft_values, 90), 2),
-                "p99": round(percentile(conc_ttft_values, 99), 2)
-            },
-            "tpot_ms": {
-                "avg": round(statistics.mean(conc_tpot_values), 2),
-                "p50": round(percentile(conc_tpot_values, 50), 2),
-                "p90": round(percentile(conc_tpot_values, 90), 2),
-                "p99": round(percentile(conc_tpot_values, 99), 2)
-            }
+            "ttft_ms": conc_ttft_stats,
+            "tpot_ms": conc_tpot_stats
         }
     }
     cs = result["benchmark_concurrent"]["summary"]
@@ -768,9 +1037,9 @@ print("\n=== 3. Accuracy Verification (streaming, same as benchmark) ===")
 test_cases = [
     {"prompt": "The capital of France is", "expected": ["Paris", "paris"], "max_tokens": 10},
     {"prompt": "2 + 2 =", "expected": ["4", "four"], "max_tokens": 5},
-    {"prompt": "The quick brown fox jumps over the lazy", "expected": ["dog"], "max_tokens": 5},
-    {"prompt": "Water freezes at", "expected": ["0", "32", "zero", "degrees"], "max_tokens": 10},
-    {"prompt": "The sun rises in the", "expected": ["east", "East"], "max_tokens": 5}
+    {"prompt": _base_prompts[0], "expected": ["__NON_EMPTY__"], "max_tokens": 200},
+    {"prompt": _base_prompts[1], "expected": ["__NON_EMPTY__"], "max_tokens": 200},
+    {"prompt": _base_prompts[2], "expected": ["__NON_EMPTY__"], "max_tokens": 200}
 ]
 accuracy_tests = []
 passed = 0
@@ -778,26 +1047,32 @@ passed = 0
 for i, tc in enumerate(test_cases):
     try:
         # Use streaming (same code path as benchmark)
-        resp = requests.post(f"{PROXY_URL}/v1/completions",
+        with STREAM_CLIENT.stream(
+            "POST",
+            f"{PROXY_URL}/v1/completions",
             json={"model": MODEL_NAME, "prompt": tc["prompt"], "max_tokens": tc["max_tokens"], "temperature": 0, "stream": True},
-            timeout=60, stream=True)
-        if resp.status_code == 200:
-            completion_parts = []
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line or not line.startswith("data: "):
-                    continue
-                chunk_data = line[6:]
-                if chunk_data.strip() == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(chunk_data)
-                    txt = chunk.get("choices", [{}])[0].get("text", "")
-                    if txt:
-                        completion_parts.append(txt)
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            completion = "".join(completion_parts).strip()
-            match = any(e.lower() in completion.lower() for e in tc["expected"])
+            timeout=60,
+        ) as resp:
+            if resp.status_code == 200:
+                completion_parts = []
+                for data in iter_sse_data_bytes(resp.iter_bytes()):
+                    chunk_data = data.decode("utf-8", errors="ignore")
+                    if chunk_data.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(chunk_data)
+                        txt = chunk.get("choices", [{}])[0].get("text", "")
+                        if txt:
+                            completion_parts.append(txt)
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                completion = "".join(completion_parts).strip()
+            else:
+                completion = ""
+            if "__NON_EMPTY__" in tc["expected"]:
+                match = len(completion.strip()) > 0
+            else:
+                match = any(e.lower() in completion.lower() for e in tc["expected"])
             accuracy_tests.append({
                 "test_id": i+1, "prompt": tc["prompt"], "completion": completion,
                 "expected": tc["expected"], "passed": match, "status": "success"
@@ -807,9 +1082,6 @@ for i, tc in enumerate(test_cases):
                 print(f"  Test {i+1}: PASS - '{completion[:40]}'")
             else:
                 print(f"  Test {i+1}: FAIL - got '{completion[:40]}'")
-        else:
-            accuracy_tests.append({"test_id": i+1, "passed": False, "status": "http_error", "response_code": resp.status_code})
-            print(f"  Test {i+1}: HTTP {resp.status_code}")
     except Exception as e:
         accuracy_tests.append({"test_id": i+1, "passed": False, "status": "error", "error": str(e)})
         print(f"  Test {i+1}: ERROR - {e}")

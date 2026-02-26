@@ -21,6 +21,12 @@ from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+if not logging.getLogger().handlers:
+    log_level = os.environ.get("PUSH_PROXY_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 
 
 @asynccontextmanager
@@ -206,6 +212,8 @@ async def _handle_completions(api: str, request: Request):
         async def generate():
             # Fire prefill AFTER decode stream starts (decode allocs first)
             prefill_task = asyncio.create_task(_delayed_prefill())
+            log_chunks = os.environ.get("PUSH_PROXY_CHUNK_LOG", "0") == "1"
+            chunk_idx = 0
             try:
                 async with decode_client["client"].stream(
                     "POST", api, json=decode_data, headers=headers
@@ -214,7 +222,15 @@ async def _handle_completions(api: str, request: Request):
                     logger.info(
                         "[PushProxy] decode req=%s status=%s",
                         request_id, response.status_code)
-                    async for chunk in response.aiter_bytes():
+                    async for line in response.aiter_lines():
+                        if line == "":
+                            continue
+                        chunk = (line + "\n").encode("utf-8")
+                        if log_chunks:
+                            chunk_idx += 1
+                            logger.info(
+                                "[PushProxy] decode req=%s chunk=%d bytes=%d",
+                                request_id, chunk_idx, len(chunk))
                         yield chunk
             finally:
                 # Ensure prefill task completes (even if decode finishes first)
@@ -228,7 +244,13 @@ async def _handle_completions(api: str, request: Request):
                     logger.error("Prefill request failed: %s", e)
 
         return StreamingResponse(
-            generate(), media_type="application/json")
+            generate(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
 
     except Exception as e:
         import sys
