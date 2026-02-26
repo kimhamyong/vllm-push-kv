@@ -235,6 +235,7 @@ DECODE_NORMAL_SSH
     # --- Start prefill server locally ---
     echo "[normal] Starting prefill server on ${PREFILL_IP}..."
     export HF_HUB_OFFLINE=1
+    export VLLM_LOGGING_LEVEL=DEBUG
     export VLLM_NIXL_SIDE_CHANNEL_HOST=$PREFILL_IP
     export VLLM_NIXL_SIDE_CHANNEL_PORT=14580
     export UCX_TLS=cuda_copy,tcp
