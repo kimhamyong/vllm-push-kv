@@ -2694,16 +2694,14 @@ class NixlConnectorWorker:
                 self._push_targets.pop(req_id, None)
                 self._push_all_layers_submitted.discard(req_id)
             elif not layer_handles:
-                # 중간 chunk: 모든 레이어 WRITE 완료했지만 마지막 chunk 아님.
-                # D: 보내지 않고 정리만. (안 하면 drain에서 무한 루프)
+                # 중간 chunk: 이번 step에서 제출된 레이어 핸들이 모두 완료.
+                # _push_layer_transfers만 정리 (drain 무한루프 방지).
+                # _push_targets는 유지! 다음 chunk에서 재사용해야 함.
                 del self._push_layer_transfers[req_id]
-                self._push_targets.pop(req_id, None)
 
     def _drain_push_layer_transfers(self) -> None:
         """Block until all per-layer WRITE handles reach SENT (async)
         or DONE (sync), with notifications sent accordingly."""
-        if not self._push_layer_transfers:
-            return
         timeout_s = 30.0
         start = time.perf_counter()
         while self._push_layer_transfers:
@@ -2794,7 +2792,7 @@ class NixlConnectorWorker:
             logger.info(
                 "Sent D: notif req=%s to %s",
                 req_id, agent_name)
-            logger.info("🐾 push 완료! (%s)", notif_id)
+            logger.info("push 완료! (%s)", notif_id)
 
     _last_save_kv_ts: float = 0.0
 
@@ -3003,7 +3001,10 @@ class NixlConnectorWorker:
                     )
 
         # Per-layer mode: drain remaining handles, send D: notifications.
-        if self._push_layer_transfers and not self._is_all_layers_mode:
+        has_pending_push = (self._push_layer_transfers
+                            or self._background_layer_handles
+                            or self._background_layer_notif_handles)
+        if has_pending_push and not self._is_all_layers_mode:
             self._drain_push_layer_transfers()
             # D: 알림은 마지막 chunk에서만 (_push_all_layers_submitted에 있을 때만).
             # _drain_push_layer_transfers → _poll_push_layer_completions에서
