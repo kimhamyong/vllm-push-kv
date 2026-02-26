@@ -984,10 +984,11 @@ class NixlConnectorScheduler:
             # If do_remote_prefill is still True when the request is finished,
             # update_state_after_alloc must not have been called (the request
             # must have been aborted before it was scheduled).
-            # To avoid stranding the prefill blocks in the prefill instance,
-            # we must add empty block_ids to _reqs_need_recv so that our
-            # worker side will notify and free blocks in the prefill instance.
-            self._reqs_need_recv[request.request_id] = (request, [])
+            # Pull mode: add empty block_ids so worker side notifies and frees
+            # blocks in the prefill instance.
+            # Push mode: no ZMQ was sent, so nothing to clean up.
+            if not params.get("push_mode"):
+                self._reqs_need_recv[request.request_id] = (request, [])
             params["do_remote_prefill"] = False
             return False, None
 
@@ -2688,8 +2689,9 @@ class NixlConnectorWorker:
             done_notif = f"D:{notif_id}:{self.world_size}".encode()
             self.nixl_wrapper.send_notif(agent_name, done_notif)
             logger.info(
-                "Sent D: notif (push_done) req=%s to %s",
+                "Sent D: notif req=%s to %s",
                 req_id, agent_name)
+            logger.info("🐾 push 완료! (%s)", notif_id)
 
     _last_save_kv_ts: float = 0.0
 
