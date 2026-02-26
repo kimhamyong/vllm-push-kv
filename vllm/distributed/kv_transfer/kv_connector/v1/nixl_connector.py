@@ -1241,6 +1241,9 @@ class NixlConnectorWorker:
         # Each entry: (handle, agent_name, notif_id, layer_idx)
         self._background_layer_notif_handles: list[
             tuple[TransferHandle, str, str, int]] = []
+        # Track requests where all layers have been submitted for WRITE.
+        # _poll_push_layer_completions only sends D: when req is in this set.
+        self._push_all_layers_submitted: set[ReqId] = set()
         # Async ACK (default): return at SENT state, flush in background.
         # Set VLLM_PUSH_SYNC_ACK=1 to block until DONE (TCP ACK).
         self._push_async_ack = os.environ.get(
@@ -1254,7 +1257,8 @@ class NixlConnectorWorker:
         # Per-layer push pipelining (Decode side)
         self._push_recv_layer_pending: dict[ReqId, set[int]] = {}
         # Buffer for push notifications that arrived before mapping was set up
-        self._push_notif_buffer: list[str] = []
+        # Each entry: (msg, first_buffered_time)
+        self._push_notif_buffer: list[tuple[str, float]] = []
         # Worker push listener thread
         self._push_listener_thread: threading.Thread | None = None
         self._push_listener_stop_event = threading.Event()
@@ -2542,6 +2546,8 @@ class NixlConnectorWorker:
             self.nixl_wrapper.transfer(handle)
             if write_layer_idx is not None and not self._is_all_layers_mode:
                 self._push_layer_transfers[req_id][write_layer_idx] = handle
+                if is_last_layer:
+                    self._push_all_layers_submitted.add(req_id)
             else:
                 self._sending_transfers[req_id].append(handle)
             logger.debug(
@@ -2628,9 +2634,9 @@ class NixlConnectorWorker:
                     )
                     self._handle_failed_transfer(req_id, handle)
                     del layer_handles[layer_idx]
-            if not layer_handles:
-                # All layers for this request done — send D: immediately
-                # so Decode unblocks without waiting for batch drain.
+            if (not layer_handles
+                    and req_id in self._push_all_layers_submitted):
+                # All layers submitted AND completed — send D: now.
                 done_notif = (
                     f"D:{notif_id}:{self.world_size}"
                 ).encode()
@@ -2639,6 +2645,7 @@ class NixlConnectorWorker:
                     "Sent D: notif req=%s to %s", req_id, agent_name)
                 del self._push_layer_transfers[req_id]
                 self._push_targets.pop(req_id, None)
+                self._push_all_layers_submitted.discard(req_id)
 
     def _drain_push_layer_transfers(self) -> None:
         """Block until all per-layer WRITE handles reach SENT (async)
@@ -2908,12 +2915,14 @@ class NixlConnectorWorker:
             self._push_targets.clear()
             self._pending_push_reqs.clear()
             self._push_layer_transfers.clear()
+            self._push_all_layers_submitted.clear()
             return
 
         if not self._sending_transfers:
             # Clean up push state
             self._push_targets.clear()
             self._pending_push_reqs.clear()
+            self._push_all_layers_submitted.clear()
             return
 
         _t_start = time.perf_counter()
@@ -3114,27 +3123,35 @@ class NixlConnectorWorker:
         notified_req_ids: set[str] = set()
 
         # Collect all messages: buffered (from previous calls) + new
-        all_msgs: list[str] = list(self._push_notif_buffer)
+        now = time.perf_counter()
+        _NOTIF_BUFFER_TTL = 60.0  # seconds
+        all_msgs: list[tuple[str, float]] = []
+        for msg, ts in self._push_notif_buffer:
+            if now - ts > _NOTIF_BUFFER_TTL:
+                logger.warning(
+                    "Dropping stale buffered notification "
+                    "(age=%.1fs): %s", now - ts, msg)
+                continue
+            all_msgs.append((msg, ts))
         self._push_notif_buffer.clear()
         for notifs in self.nixl_wrapper.get_new_notifs().values():
             for notif in notifs:
-                all_msgs.append(notif.decode("utf-8"))
+                all_msgs.append((notif.decode("utf-8"), now))
 
-        for msg in all_msgs:
+        for msg, buffered_ts in all_msgs:
             logger.info("Push notif recv: %s", msg)
             # Per-layer push notifications: L:<proxy_req_id>:<layer_idx>:<tp_size>
             if msg.startswith("L:"):
                 _, proxy_req_id, layer_s, _tp = msg.split(":", 3)
                 local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
                 if local_req_id is None:
-                    # Mapping not set up yet; buffer for next call
                     logger.info(
                         "Push L: buffering (no mapping yet) "
                         "proxy_id=%s layer=%s",
                         proxy_req_id,
                         layer_s,
                     )
-                    self._push_notif_buffer.append(msg)
+                    self._push_notif_buffer.append((msg, buffered_ts))
                     continue
                 pending = self._push_recv_layer_pending.get(local_req_id)
                 if pending is not None:
@@ -3167,12 +3184,11 @@ class NixlConnectorWorker:
                 _, proxy_req_id, _tp = msg.split(":", 2)
                 local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
                 if local_req_id is None:
-                    # Mapping not set up yet; buffer for next call
                     logger.info(
                         "Push D: buffering (no mapping yet) proxy_id=%s",
                         proxy_req_id,
                     )
-                    self._push_notif_buffer.append(msg)
+                    self._push_notif_buffer.append((msg, buffered_ts))
                     continue
                 self._push_recv_reqs.discard(local_req_id)
                 # If no per-layer tracking (all_layers_mode),
