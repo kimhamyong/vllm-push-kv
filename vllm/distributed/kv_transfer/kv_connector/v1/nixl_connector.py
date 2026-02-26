@@ -1253,6 +1253,8 @@ class NixlConnectorWorker:
         self._push_proxy_to_local_req: dict[str, ReqId] = {}
         # Per-layer push pipelining (Decode side)
         self._push_recv_layer_pending: dict[ReqId, set[int]] = {}
+        # Buffer for push notifications that arrived before mapping was set up
+        self._push_notif_buffer: list[str] = []
         # Worker push listener thread
         self._push_listener_thread: threading.Thread | None = None
         self._push_listener_stop_event = threading.Event()
@@ -3110,109 +3112,121 @@ class NixlConnectorWorker:
         """
         assert self.kv_topo is not None
         notified_req_ids: set[str] = set()
+
+        # Collect all messages: buffered (from previous calls) + new
+        all_msgs: list[str] = list(self._push_notif_buffer)
+        self._push_notif_buffer.clear()
         for notifs in self.nixl_wrapper.get_new_notifs().values():
             for notif in notifs:
-                msg = notif.decode("utf-8")
-                # Per-layer push notifications: L:<proxy_req_id>:<layer_idx>:<tp_size>
-                if msg.startswith("L:"):
-                    _, proxy_req_id, layer_s, _tp = msg.split(":", 3)
-                    local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
-                    if local_req_id is not None:
-                        pending = self._push_recv_layer_pending.get(local_req_id)
-                        if pending is not None:
-                            try:
-                                pending.discard(int(layer_s))
-                            except ValueError:
-                                pass
-                            # All layers received — transition to done.
-                            if not pending:
-                                self._push_done_recving.add(local_req_id)
-                                self._push_recv_reqs.discard(local_req_id)
-                                self._push_recv_layer_pending.pop(
-                                    local_req_id, None)
-                                del self._push_proxy_to_local_req[
-                                    proxy_req_id]
-                                logger.debug(
-                                    "All layers received for req=%s "
-                                    "(proxy_id=%s)",
-                                    local_req_id,
-                                    proxy_req_id,
-                                )
-                    continue
+                all_msgs.append(notif.decode("utf-8"))
 
-                # Request completion notifications: D:<proxy_req_id>:<tp_size>
-                # D: signals all layers are in flight (SENT), but GPU data
-                # may not have arrived yet.  Keep _push_recv_layer_pending
-                # and _push_proxy_to_local_req alive so that subsequent L:
-                # (sent at DONE) can drain the pending set properly.
-                if msg.startswith("D:"):
-                    _, proxy_req_id, _tp = msg.split(":", 2)
-                    local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
-                    if local_req_id is not None:
+        for msg in all_msgs:
+            # Per-layer push notifications: L:<proxy_req_id>:<layer_idx>:<tp_size>
+            if msg.startswith("L:"):
+                _, proxy_req_id, layer_s, _tp = msg.split(":", 3)
+                local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
+                if local_req_id is None:
+                    # Mapping not set up yet; buffer for next call
+                    self._push_notif_buffer.append(msg)
+                    continue
+                pending = self._push_recv_layer_pending.get(local_req_id)
+                if pending is not None:
+                    try:
+                        pending.discard(int(layer_s))
+                    except ValueError:
+                        pass
+                    # All layers received — transition to done.
+                    if not pending:
+                        self._push_done_recving.add(local_req_id)
                         self._push_recv_reqs.discard(local_req_id)
-                        # If no per-layer tracking (all_layers_mode),
-                        # treat D: as done immediately.
-                        if local_req_id not in self._push_recv_layer_pending:
-                            self._push_done_recving.add(local_req_id)
-                            del self._push_proxy_to_local_req[proxy_req_id]
+                        self._push_recv_layer_pending.pop(
+                            local_req_id, None)
+                        del self._push_proxy_to_local_req[
+                            proxy_req_id]
                         logger.debug(
-                            "Push D: received for req=%s "
-                            "(proxy_id=%s), layer_pending=%s",
+                            "All layers received for req=%s "
+                            "(proxy_id=%s)",
                             local_req_id,
                             proxy_req_id,
-                            local_req_id in self._push_recv_layer_pending,
                         )
-                    continue
+                continue
 
-                # Legacy format: <proxy_req_id>:<tp_size>
-                req_id, tp_size = msg.rsplit(":", 1)
-                local_req_id = self._push_proxy_to_local_req.get(req_id)
-                if local_req_id is not None:
-                    self._push_recv_reqs.discard(local_req_id)
+            # Request completion notifications: D:<proxy_req_id>:<tp_size>
+            # D: signals all layers are in flight (SENT), but GPU data
+            # may not have arrived yet.  Keep _push_recv_layer_pending
+            # and _push_proxy_to_local_req alive so that subsequent L:
+            # (sent at DONE) can drain the pending set properly.
+            if msg.startswith("D:"):
+                _, proxy_req_id, _tp = msg.split(":", 2)
+                local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
+                if local_req_id is None:
+                    # Mapping not set up yet; buffer for next call
+                    self._push_notif_buffer.append(msg)
+                    continue
+                self._push_recv_reqs.discard(local_req_id)
+                # If no per-layer tracking (all_layers_mode),
+                # treat D: as done immediately.
+                if local_req_id not in self._push_recv_layer_pending:
                     self._push_done_recving.add(local_req_id)
-                    self._push_recv_layer_pending.pop(local_req_id, None)
-                    del self._push_proxy_to_local_req[req_id]
-                    logger.debug(
-                        "Push notification received for req=%s "
-                        "(proxy_id=%s)",
-                        local_req_id,
-                        req_id,
-                    )
-                    continue
-
-                # Pull mode: existing logic
-                if (
-                    req_id not in self._reqs_to_send
-                    and req_id not in self._reqs_to_process
-                ):
-                    logger.error(
-                        "Potentially invalid KV blocks for "
-                        "unrecognized request %s were retrieved by "
-                        "a decode worker. They may have expired.",
-                        req_id,
-                    )
-                    continue
-
-                # NOTE: `tp_ratio` is the opposite when swapping local<>remote
-                n_consumers = int(tp_size)
-                tp_ratio = self.kv_topo.tp_ratio(n_consumers)
-
-                # Number of reads *per producer* to wait for.
-                # When remote D TP > local P TP we expect `tp_ratio` reads.
-                consumers_per_producer = (
-                    -tp_ratio if n_consumers > self.world_size else 1
+                    del self._push_proxy_to_local_req[proxy_req_id]
+                logger.debug(
+                    "Push D: received for req=%s "
+                    "(proxy_id=%s), layer_pending=%s",
+                    local_req_id,
+                    proxy_req_id,
+                    local_req_id in self._push_recv_layer_pending,
                 )
+                continue
 
-                self.consumer_notification_counts_by_req[req_id] += 1
-                # Wait all consumers (D) to be done reading before freeing.
-                if (
-                    self.consumer_notification_counts_by_req[req_id]
-                    == consumers_per_producer
-                ):
-                    notified_req_ids.add(req_id)
-                    del self.consumer_notification_counts_by_req[req_id]
-                    self._reqs_to_process.remove(req_id)
-                    self._reqs_to_send.pop(req_id, None)
+            # Legacy format: <proxy_req_id>:<tp_size>
+            req_id, tp_size = msg.rsplit(":", 1)
+            local_req_id = self._push_proxy_to_local_req.get(req_id)
+            if local_req_id is not None:
+                self._push_recv_reqs.discard(local_req_id)
+                self._push_done_recving.add(local_req_id)
+                self._push_recv_layer_pending.pop(local_req_id, None)
+                del self._push_proxy_to_local_req[req_id]
+                logger.debug(
+                    "Push notification received for req=%s "
+                    "(proxy_id=%s)",
+                    local_req_id,
+                    req_id,
+                )
+                continue
+
+            # Pull mode: existing logic
+            if (
+                req_id not in self._reqs_to_send
+                and req_id not in self._reqs_to_process
+            ):
+                logger.error(
+                    "Potentially invalid KV blocks for "
+                    "unrecognized request %s were retrieved by "
+                    "a decode worker. They may have expired.",
+                    req_id,
+                )
+                continue
+
+            # NOTE: `tp_ratio` is the opposite when swapping local<>remote
+            n_consumers = int(tp_size)
+            tp_ratio = self.kv_topo.tp_ratio(n_consumers)
+
+            # Number of reads *per producer* to wait for.
+            # When remote D TP > local P TP we expect `tp_ratio` reads.
+            consumers_per_producer = (
+                -tp_ratio if n_consumers > self.world_size else 1
+            )
+
+            self.consumer_notification_counts_by_req[req_id] += 1
+            # Wait all consumers (D) to be done reading before freeing.
+            if (
+                self.consumer_notification_counts_by_req[req_id]
+                == consumers_per_producer
+            ):
+                notified_req_ids.add(req_id)
+                del self.consumer_notification_counts_by_req[req_id]
+                self._reqs_to_process.remove(req_id)
+                self._reqs_to_send.pop(req_id, None)
         return notified_req_ids
 
     def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
