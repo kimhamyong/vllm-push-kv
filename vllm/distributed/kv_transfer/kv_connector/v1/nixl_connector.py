@@ -2614,6 +2614,7 @@ class NixlConnectorWorker:
             )
             if agent_name is None:
                 continue
+            is_partial = target.get("is_partial", False)
             for layer_idx, handle in list(layer_handles.items()):
                 try:
                     xfer_state = self.nixl_wrapper.check_xfer_state(handle)
@@ -2621,21 +2622,25 @@ class NixlConnectorWorker:
                         res = self.nixl_wrapper.get_xfer_telemetry(handle)
                         self.xfer_stats.record_transfer(res)
                         self.nixl_wrapper.release_xfer_handle(handle)
-                        notif = (
-                            f"L:{notif_id}:{layer_idx}:{self.world_size}"
-                        ).encode()
-                        self.nixl_wrapper.send_notif(agent_name, notif)
-                        logger.info(
-                            "Sent L: notif req=%s layer=%d to %s",
-                            req_id, layer_idx, agent_name)
+                        if not is_partial:
+                            notif = (
+                                f"L:{notif_id}:{layer_idx}"
+                                f":{self.world_size}"
+                            ).encode()
+                            self.nixl_wrapper.send_notif(
+                                agent_name, notif)
+                            logger.info(
+                                "Sent L: notif req=%s layer=%d to %s",
+                                req_id, layer_idx, agent_name)
                         del layer_handles[layer_idx]
                     elif xfer_state == "SENT" and self._push_async_ack:
-                        # Data copied to CPU buffer — GPU can be freed.
-                        # Do NOT send L: here; L: is deferred until DONE
-                        # to guarantee GPU data arrival on Decode side.
-                        # Move handle to background for DONE tracking.
-                        self._background_layer_notif_handles.append(
-                            (handle, agent_name, notif_id, layer_idx))
+                        if not is_partial:
+                            # 마지막 chunk: background에서 DONE 시 L: 전송
+                            self._background_layer_notif_handles.append(
+                                (handle, agent_name, notif_id, layer_idx))
+                        else:
+                            # 중간 chunk: L: 없이 handle release만 추적
+                            self._background_layer_handles.append(handle)
                         del layer_handles[layer_idx]
                     elif xfer_state in ("PROC", "SENT"):
                         continue
@@ -2659,8 +2664,7 @@ class NixlConnectorWorker:
                     del layer_handles[layer_idx]
             if (not layer_handles
                     and req_id in self._push_all_layers_submitted):
-                # All layers submitted AND completed — send D: now.
-                # (마지막 chunk에서만 _push_all_layers_submitted에 들어감)
+                # 마지막 chunk: 모든 레이어 제출+완료 → D: 전송
                 done_notif = (
                     f"D:{notif_id}:{self.world_size}"
                 ).encode()
@@ -2670,11 +2674,6 @@ class NixlConnectorWorker:
                 del self._push_layer_transfers[req_id]
                 self._push_targets.pop(req_id, None)
                 self._push_all_layers_submitted.discard(req_id)
-            elif not layer_handles:
-                # 중간 chunk: 모든 레이어 WRITE 완료했지만 마지막 chunk 아님.
-                # D: 보내지 않고 정리만. (안 하면 drain에서 무한 루프)
-                del self._push_layer_transfers[req_id]
-                self._push_targets.pop(req_id, None)
 
     def _drain_push_layer_transfers(self) -> None:
         """Block until all per-layer WRITE handles reach SENT (async)
@@ -2685,6 +2684,11 @@ class NixlConnectorWorker:
         start = time.perf_counter()
         while self._push_layer_transfers:
             self._poll_push_layer_completions()
+            # 중간 chunk: 핸들 다 완료됐지만 _push_all_layers_submitted에
+            # 없어서 _poll에서 삭제 안 됨. 빈 dict 엔트리 직접 정리.
+            for rid in list(self._push_layer_transfers.keys()):
+                if not self._push_layer_transfers[rid]:
+                    del self._push_layer_transfers[rid]
             if not self._push_layer_transfers:
                 break
             if time.perf_counter() - start > timeout_s:
