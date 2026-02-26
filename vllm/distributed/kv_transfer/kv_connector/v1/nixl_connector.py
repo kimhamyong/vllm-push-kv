@@ -3127,6 +3127,7 @@ class NixlConnectorWorker:
                             # All layers received — transition to done.
                             if not pending:
                                 self._push_done_recving.add(local_req_id)
+                                self._push_recv_reqs.discard(local_req_id)
                                 self._push_recv_layer_pending.pop(
                                     local_req_id, None)
                                 del self._push_proxy_to_local_req[
