@@ -20,7 +20,7 @@ echo "Will connect to Prefill NIXL: $PREFILL_IP:14580"
 vllm serve $MODEL_NAME \
     --host 0.0.0.0 \
     --port 8200 \
-    --max-model-len 2048 \
+    --max-model-len 24576 \
     --gpu-memory-utilization 0.8 \
     --trust-remote-code \
     --enforce-eager \

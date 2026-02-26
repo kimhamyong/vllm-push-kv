@@ -18,15 +18,17 @@ SCRIPT_NAME="benchmark_disagg"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RESULTS_DIR="/home/ubuntu/vllm/results/${SCRIPT_NAME}"
 RESULT_FILE="${RESULTS_DIR}/${SCRIPT_NAME}_${TIMESTAMP}.json"
-NUM_PROMPTS=${NUM_PROMPTS:-20}
+NUM_PROMPTS=${NUM_PROMPTS:-10}
 OUTPUT_LEN=${OUTPUT_LEN:-200}
+SEQ_PROMPT_FILE=${SEQ_PROMPT_FILE:-/home/ubuntu/vllm/disagg_prompts/seq_24576.txt}
+CONC_PROMPT_FILE=${CONC_PROMPT_FILE:-/home/ubuntu/vllm/disagg_prompts/conc_12288.txt}
 
 # Create results directory
 mkdir -p "$RESULTS_DIR"
 
 # Export variables for Python
 export MODEL_NAME PROXY_URL PREFILL_URL DECODE_URL
-export NUM_PROMPTS OUTPUT_LEN RESULT_FILE TIMESTAMP
+export NUM_PROMPTS OUTPUT_LEN RESULT_FILE TIMESTAMP SEQ_PROMPT_FILE CONC_PROMPT_FILE
 
 echo "=============================================="
 echo "Disaggregated Prefill Benchmark"
@@ -83,7 +85,7 @@ if [ "${NSYS_PROFILE}" = "1" ] && command -v nsys &> /dev/null; then
         ${VLLM_BIN} serve ${MODEL_NAME} \
             --host 0.0.0.0 \
             --port 8100 \
-            --max-model-len 2048 \
+            --max-model-len 24576 \
             --gpu-memory-utilization 0.8 \
             --trust-remote-code \
             --enforce-eager \
@@ -144,7 +146,7 @@ export UCX_TCP_PORT_RANGE=40000-40009
 nohup /home/ubuntu/vllm/.venv/bin/vllm serve meta-llama/Llama-3.2-1B \
     --host 0.0.0.0 \
     --port 8200 \
-    --max-model-len 2048 \
+    --max-model-len 24576 \
     --gpu-memory-utilization 0.8 \
     --trust-remote-code \
     --enforce-eager \
@@ -222,7 +224,7 @@ export UCX_TCP_PORT_RANGE=40000-40009
 nohup /home/ubuntu/vllm/.venv/bin/vllm serve meta-llama/Llama-3.2-1B \
     --host 0.0.0.0 \
     --port 8200 \
-    --max-model-len 2048 \
+            --max-model-len 24576 \
     --gpu-memory-utilization 0.8 \
     --trust-remote-code \
     --enforce-eager \
@@ -246,7 +248,7 @@ DECODE_NORMAL_SSH
     ${VLLM_BIN} serve ${MODEL_NAME} \
         --host 0.0.0.0 \
         --port 8100 \
-        --max-model-len 2048 \
+    --max-model-len 24576 \
         --gpu-memory-utilization 0.8 \
         --trust-remote-code \
         --enforce-eager \
@@ -301,6 +303,14 @@ PREFILL_URL = os.environ.get("PREFILL_URL", "http://172.31.2.19:8100")
 DECODE_URL = os.environ.get("DECODE_URL", "http://172.31.0.191:8200")
 NUM_PROMPTS = int(os.environ.get("NUM_PROMPTS", "20"))
 OUTPUT_LEN = int(os.environ.get("OUTPUT_LEN", "200"))
+SEQ_PROMPT_FILE = os.environ.get(
+    "SEQ_PROMPT_FILE",
+    "/home/ubuntu/vllm/disagg_prompts/seq_24576.txt",
+)
+CONC_PROMPT_FILE = os.environ.get(
+    "CONC_PROMPT_FILE",
+    "/home/ubuntu/vllm/disagg_prompts/conc_12288.txt",
+)
 
 RESULT_FILE = os.environ.get("RESULT_FILE", "/home/ubuntu/vllm/results/benchmark_disagg/benchmark_disagg.json")
 TIMESTAMP = os.environ.get("TIMESTAMP", datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -431,8 +441,25 @@ _base_prompts = [
     "Language is the foundation of human civilization a uniquely complex system of communication that allows us to share thoughts express emotions preserve knowledge across generations and coordinate collective action on scales unmatched by any other species on Earth. Linguists estimate that approximately seven thousand languages are currently spoken worldwide each reflecting a unique way of categorizing and understanding reality through distinct grammatical structures vocabularies and sound systems. The Sapir Whorf hypothesis suggests that the language we speak influences how we think and perceive the world with research showing that speakers of different languages may categorize colors remember events and conceptualize time in measurably different ways. Historical linguistics traces the evolution of language families revealing deep connections between seemingly unrelated tongues and providing insights into ancient migration patterns cultural contacts and the cognitive capabilities of our ancestors. The emergence of writing approximately five thousand years ago in Mesopotamia and independently in China and Mesoamerica marked a watershed moment enabling the accumulation and transmission of knowledge across time and space that made complex civilizations possible.",
     "Music is a universal human experience found in every known culture throughout history serving as a vehicle for emotional expression social bonding spiritual practice storytelling and artistic innovation that engages the brain in uniquely powerful ways activating regions associated with movement emotion memory language and reward simultaneously. The physics of sound waves determines the mathematical relationships between musical intervals with consonant harmonies arising from simple frequency ratios that the human auditory system finds naturally pleasing while dissonance creates tension that composers exploit for expressive effect. Western classical music evolved over centuries from the monophonic chants of medieval monasteries through the polyphonic complexity of the Baroque period the emotional depth of Romanticism and the radical experimentation of twentieth century modernism. Jazz emerged in early twentieth century America blending African rhythmic traditions European harmonic structures and improvisational creativity into a uniquely expressive art form that influenced virtually every genre of popular music that followed. Electronic music production has democratized musical creation allowing anyone with a computer to compose arrange and produce professional quality recordings using virtual instruments and digital audio processing tools that would have been unimaginable just decades ago."
 ]
-# Multiply prompts to reach NUM_PROMPTS
-benchmark_prompts = [_base_prompts[i % len(_base_prompts)] for i in range(NUM_PROMPTS)]
+
+def _load_prompts(path: str, n: int):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        if not lines:
+            return None
+        return [lines[i % len(lines)] for i in range(n)]
+    except Exception:
+        return None
+
+benchmark_prompts = _load_prompts(SEQ_PROMPT_FILE, NUM_PROMPTS)
+if benchmark_prompts is None:
+    # Fallback to built-in prompts
+    benchmark_prompts = [
+        _base_prompts[i % len(_base_prompts)] for i in range(NUM_PROMPTS)
+    ]
+else:
+    print(f"Using sequential prompts from: {SEQ_PROMPT_FILE}")
 
 measurements = []
 latencies = []
@@ -653,7 +680,13 @@ def run_one_request(idx, prompt):
     except Exception as e:
         return {"request_id": idx+1, "status": "error", "error": str(e)}
 
-conc_prompts = [_base_prompts[i % len(_base_prompts)] for i in range(NUM_PROMPTS)]
+conc_prompts = _load_prompts(CONC_PROMPT_FILE, NUM_PROMPTS)
+if conc_prompts is None:
+    conc_prompts = [
+        _base_prompts[i % len(_base_prompts)] for i in range(NUM_PROMPTS)
+    ]
+else:
+    print(f"Using concurrent prompts from: {CONC_PROMPT_FILE}")
 print(f"Sending {len(conc_prompts)} concurrent requests...")
 conc_start = time.perf_counter()
 
