@@ -3121,12 +3121,19 @@ class NixlConnectorWorker:
                 all_msgs.append(notif.decode("utf-8"))
 
         for msg in all_msgs:
+            logger.info("Push notif recv: %s", msg)
             # Per-layer push notifications: L:<proxy_req_id>:<layer_idx>:<tp_size>
             if msg.startswith("L:"):
                 _, proxy_req_id, layer_s, _tp = msg.split(":", 3)
                 local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
                 if local_req_id is None:
                     # Mapping not set up yet; buffer for next call
+                    logger.info(
+                        "Push L: buffering (no mapping yet) "
+                        "proxy_id=%s layer=%s",
+                        proxy_req_id,
+                        layer_s,
+                    )
                     self._push_notif_buffer.append(msg)
                     continue
                 pending = self._push_recv_layer_pending.get(local_req_id)
@@ -3161,6 +3168,10 @@ class NixlConnectorWorker:
                 local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
                 if local_req_id is None:
                     # Mapping not set up yet; buffer for next call
+                    logger.info(
+                        "Push D: buffering (no mapping yet) proxy_id=%s",
+                        proxy_req_id,
+                    )
                     self._push_notif_buffer.append(msg)
                     continue
                 self._push_recv_reqs.discard(local_req_id)

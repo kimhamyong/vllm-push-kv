@@ -155,7 +155,7 @@ async def _handle_completions(api: str, request: Request):
             "X-Request-Id": request_id,
         }
 
-        logger.debug(
+        logger.info(
             "[PushProxy] req=%s prefill=%s decode=%s",
             request_id, prefill_client["id"], decode_client["id"])
 
@@ -166,6 +166,9 @@ async def _handle_completions(api: str, request: Request):
             "do_push_kv": True,
             "decode_request_id": request_id,
         }
+        logger.info(
+            "[PushProxy] prefill req=%s kv_transfer_params=%s",
+            request_id, prefill_data["kv_transfer_params"])
         prefill_data["stream"] = False
         prefill_data["max_tokens"] = 1
         prefill_data.pop("min_tokens", None)
@@ -184,6 +187,9 @@ async def _handle_completions(api: str, request: Request):
             "prefill_zmq_port": global_args.prefiller_zmq_port,
             "proxy_request_id": request_id,
         }
+        logger.info(
+            "[PushProxy] decode req=%s kv_transfer_params=%s",
+            request_id, decode_data["kv_transfer_params"])
 
         # Delay (ms) before sending prefill request.
         # Gives decode time to alloc blocks + send ZMQ block_info,
@@ -205,6 +211,9 @@ async def _handle_completions(api: str, request: Request):
                     "POST", api, json=decode_data, headers=headers
                 ) as response:
                     response.raise_for_status()
+                    logger.info(
+                        "[PushProxy] decode req=%s status=%s",
+                        request_id, response.status_code)
                     async for chunk in response.aiter_bytes():
                         yield chunk
             finally:
@@ -212,6 +221,9 @@ async def _handle_completions(api: str, request: Request):
                 try:
                     resp = await prefill_task
                     resp.raise_for_status()
+                    logger.info(
+                        "[PushProxy] prefill req=%s status=%s",
+                        request_id, resp.status_code)
                 except Exception as e:
                     logger.error("Prefill request failed: %s", e)
 
