@@ -1236,6 +1236,10 @@ class NixlConnectorWorker:
         self._background_transfers: dict[ReqId, list[TransferHandle]] = {}
         # Background flush handles for per-layer SENT completions.
         self._background_layer_handles: list[TransferHandle] = []
+        # Background layer handles awaiting DONE to send L: notification.
+        # Each entry: (handle, agent_name, notif_id, layer_idx)
+        self._background_layer_notif_handles: list[
+            tuple[TransferHandle, str, str, int]] = []
         # Async ACK (default): return at SENT state, flush in background.
         # Set VLLM_PUSH_SYNC_ACK=1 to block until DONE (TCP ACK).
         self._push_async_ack = os.environ.get(
@@ -2554,14 +2558,16 @@ class NixlConnectorWorker:
     def _poll_push_layer_completions(self) -> None:
         """Poll per-layer WRITE handles and send L: notifications.
 
-        When async ACK is enabled (default), L: notifications are sent
-        at SENT state (data copied to CPU buffer, GPU can be freed)
-        and the handle is moved to background for flush completion.
-        This allows Decode to start forward() for each layer as soon
-        as the data is in flight, enabling compute-transfer overlap.
+        L: notifications are always sent at DONE state to guarantee
+        GPU data arrival on the Decode side.  When async ACK is
+        enabled (default), handles that reach SENT are moved to
+        background (_background_layer_notif_handles) and L: is sent
+        when they reach DONE in _drain_background_pushes().
+        D: is still sent when all layers reach SENT so the scheduler
+        can unblock early.
 
         When async ACK is disabled (VLLM_PUSH_SYNC_ACK=1), L:
-        notifications are sent at DONE state (full ACK received).
+        notifications are sent at DONE state inline.
         """
         if not self._push_layer_transfers:
             return
@@ -2590,14 +2596,11 @@ class NixlConnectorWorker:
                         del layer_handles[layer_idx]
                     elif xfer_state == "SENT" and self._push_async_ack:
                         # Data copied to CPU buffer — GPU can be freed.
-                        # Send L: notification now so Decode can start
-                        # forward() for this layer while flush completes.
-                        notif = (
-                            f"L:{notif_id}:{layer_idx}:{self.world_size}"
-                        ).encode()
-                        self.nixl_wrapper.send_notif(agent_name, notif)
-                        # Move handle to background for flush completion.
-                        self._background_layer_handles.append(handle)
+                        # Do NOT send L: here; L: is deferred until DONE
+                        # to guarantee GPU data arrival on Decode side.
+                        # Move handle to background for DONE tracking.
+                        self._background_layer_notif_handles.append(
+                            (handle, agent_name, notif_id, layer_idx))
                         del layer_handles[layer_idx]
                     elif xfer_state in ("PROC", "SENT"):
                         continue
@@ -3094,22 +3097,42 @@ class NixlConnectorWorker:
                                 pending.discard(int(layer_s))
                             except ValueError:
                                 pass
+                            # All layers received — transition to done.
+                            if not pending:
+                                self._push_done_recving.add(local_req_id)
+                                self._push_recv_layer_pending.pop(
+                                    local_req_id, None)
+                                del self._push_proxy_to_local_req[
+                                    proxy_req_id]
+                                logger.debug(
+                                    "All layers received for req=%s "
+                                    "(proxy_id=%s)",
+                                    local_req_id,
+                                    proxy_req_id,
+                                )
                     continue
 
                 # Request completion notifications: D:<proxy_req_id>:<tp_size>
+                # D: signals all layers are in flight (SENT), but GPU data
+                # may not have arrived yet.  Keep _push_recv_layer_pending
+                # and _push_proxy_to_local_req alive so that subsequent L:
+                # (sent at DONE) can drain the pending set properly.
                 if msg.startswith("D:"):
                     _, proxy_req_id, _tp = msg.split(":", 2)
                     local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
                     if local_req_id is not None:
                         self._push_recv_reqs.discard(local_req_id)
-                        self._push_done_recving.add(local_req_id)
-                        self._push_recv_layer_pending.pop(local_req_id, None)
-                        del self._push_proxy_to_local_req[proxy_req_id]
+                        # If no per-layer tracking (all_layers_mode),
+                        # treat D: as done immediately.
+                        if local_req_id not in self._push_recv_layer_pending:
+                            self._push_done_recving.add(local_req_id)
+                            del self._push_proxy_to_local_req[proxy_req_id]
                         logger.debug(
-                            "Push notification received for req=%s "
-                            "(proxy_id=%s)",
+                            "Push D: received for req=%s "
+                            "(proxy_id=%s), layer_pending=%s",
                             local_req_id,
                             proxy_req_id,
+                            local_req_id in self._push_recv_layer_pending,
                         )
                     continue
 
@@ -3271,7 +3294,9 @@ class NixlConnectorWorker:
     def _drain_background_pushes(self) -> None:
         """Lazy poll background flush handles (SENT → DONE).
         Called at the beginning of save_kv_layer() for cleanup."""
-        if not self._background_transfers and not self._background_layer_handles:
+        if (not self._background_transfers
+                and not self._background_layer_handles
+                and not self._background_layer_notif_handles):
             return
         for req_id in list(self._background_transfers.keys()):
             handles = self._background_transfers[req_id]
@@ -3319,6 +3344,34 @@ class NixlConnectorWorker:
                     logger.warning(
                         "Background layer flush exception: %s", e)
             self._background_layer_handles = remaining
+        # Drain per-layer background handles that need L: at DONE.
+        if self._background_layer_notif_handles:
+            remaining_notif: list[tuple[TransferHandle, str, str, int]] = []
+            for handle, agent_name, notif_id, layer_idx in (
+                    self._background_layer_notif_handles):
+                try:
+                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
+                    if xfer_state == "DONE":
+                        res = self.nixl_wrapper.get_xfer_telemetry(handle)
+                        self.xfer_stats.record_transfer(res)
+                        self.nixl_wrapper.release_xfer_handle(handle)
+                        # Send L: now — GPU data arrival guaranteed.
+                        notif = (
+                            f"L:{notif_id}:{layer_idx}:{self.world_size}"
+                        ).encode()
+                        self.nixl_wrapper.send_notif(agent_name, notif)
+                    elif xfer_state in ("PROC", "SENT"):
+                        remaining_notif.append(
+                            (handle, agent_name, notif_id, layer_idx))
+                    else:
+                        logger.warning(
+                            "Background layer notif flush error: %s",
+                            xfer_state)
+                        self.nixl_wrapper.release_xfer_handle(handle)
+                except Exception as e:
+                    logger.warning(
+                        "Background layer notif flush exception: %s", e)
+            self._background_layer_notif_handles = remaining_notif
 
     def _handle_failed_transfer(self, req_id: str, handle: int):
         """
@@ -3793,6 +3846,9 @@ class NixlConnectorWorker:
         for handle in self._background_layer_handles:
             self.nixl_wrapper.release_xfer_handle(handle)
         self._background_layer_handles.clear()
+        for handle, _, _, _ in self._background_layer_notif_handles:
+            self.nixl_wrapper.release_xfer_handle(handle)
+        self._background_layer_notif_handles.clear()
 
         self._handshake_initiation_executor.shutdown(wait=False)
         for handles in self._recving_transfers.values():

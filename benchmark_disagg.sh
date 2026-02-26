@@ -211,6 +211,7 @@ else
     echo "[normal] Starting decode server on ${DECODE_IP}..."
     ssh -i ${SSH_KEY} -o ConnectTimeout=5 -o StrictHostKeyChecking=no ubuntu@${DECODE_IP} bash -s << 'DECODE_NORMAL_SSH'
 export HF_HUB_OFFLINE=1
+export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_NIXL_SIDE_CHANNEL_HOST=172.31.0.191
 export VLLM_NIXL_SIDE_CHANNEL_PORT=14580
 export UCX_TLS=cuda_copy,tcp
