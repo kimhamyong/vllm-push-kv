@@ -229,10 +229,7 @@ async def _handle_completions(api: str, request: Request):
                     logger.info(
                         "[PushProxy] decode req=%s status=%s",
                         request_id, response.status_code)
-                    async for line in response.aiter_lines():
-                        if line == "":
-                            continue
-                        chunk = (line + "\n").encode("utf-8")
+                    async for chunk in response.aiter_bytes():
                         if log_chunks:
                             chunk_idx += 1
                             logger.info(
