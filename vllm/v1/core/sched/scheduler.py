@@ -598,6 +598,16 @@ class Scheduler(SchedulerInterface):
 
                 # Get already-cached tokens.
                 if request.num_computed_tokens == 0:
+                    # Push mode (Decode side): skip local prefix cache so
+                    # that ALL blocks are freshly allocated and ALL block
+                    # IDs are sent to the prefill worker for a complete
+                    # KV push transfer.
+                    if (request.kv_transfer_params
+                            and request.kv_transfer_params.get("push_mode")
+                            and request.kv_transfer_params.get(
+                                "do_remote_prefill")):
+                        request.skip_reading_prefix_cache = True
+
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
