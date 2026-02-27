@@ -3224,40 +3224,36 @@ class NixlConnectorWorker:
             assert meta is not None, f"{req_id} not found in recving_metadata list"
             assert meta.remote is not None
 
-            # DIAG: verify KV data after transfer
-            if self.device_kv_caches and meta.local_physical_block_ids:
-                try:
-                    import torch
-                    first_blk = meta.local_physical_block_ids[0]
-                    first_layer_name = next(iter(self.device_kv_caches))
-                    kv_tensor = self.device_kv_caches[first_layer_name]
-                    # Check a few values from the first block
-                    if hasattr(kv_tensor, 'shape') and len(kv_tensor.shape) >= 2:
-                        # For split K/V (5D tensor [2, N, H, S, D]):
-                        # block data is at kv_tensor[0, first_blk, ...]
-                        # For cross-layer: different layout
-                        if len(kv_tensor.shape) == 5:
-                            blk_data = kv_tensor[0, first_blk].flatten()[:20]
-                        elif len(kv_tensor.shape) == 4:
-                            blk_data = kv_tensor[first_blk].flatten()[:20]
-                        else:
-                            blk_data = kv_tensor.flatten()[:20]
-                        nonzero = torch.count_nonzero(blk_data).item()
-                        logger.info(
-                            "DIAG get_finished req=%s: "
-                            "local_block_ids=%s, first_blk=%d, "
-                            "tensor_shape=%s, "
-                            "first20_nonzero=%d/20, "
-                            "first5_vals=%s",
-                            req_id,
-                            meta.local_physical_block_ids[:5],
-                            first_blk,
-                            kv_tensor.shape,
-                            nonzero,
-                            blk_data[:5].tolist(),
-                        )
-                except Exception as diag_e:
-                    logger.info("DIAG get_finished error: %s", diag_e)
+            # # DIAG: verify KV data after transfer
+            # if self.device_kv_caches and meta.local_physical_block_ids:
+            #     try:
+            #         import torch
+            #         first_blk = meta.local_physical_block_ids[0]
+            #         first_layer_name = next(iter(self.device_kv_caches))
+            #         kv_tensor = self.device_kv_caches[first_layer_name]
+            #         if hasattr(kv_tensor, 'shape') and len(kv_tensor.shape) >= 2:
+            #             if len(kv_tensor.shape) == 5:
+            #                 blk_data = kv_tensor[0, first_blk].flatten()[:20]
+            #             elif len(kv_tensor.shape) == 4:
+            #                 blk_data = kv_tensor[first_blk].flatten()[:20]
+            #             else:
+            #                 blk_data = kv_tensor.flatten()[:20]
+            #             nonzero = torch.count_nonzero(blk_data).item()
+            #             logger.info(
+            #                 "DIAG get_finished req=%s: "
+            #                 "local_block_ids=%s, first_blk=%d, "
+            #                 "tensor_shape=%s, "
+            #                 "first20_nonzero=%d/20, "
+            #                 "first5_vals=%s",
+            #                 req_id,
+            #                 meta.local_physical_block_ids[:5],
+            #                 first_blk,
+            #                 kv_tensor.shape,
+            #                 nonzero,
+            #                 blk_data[:5].tolist(),
+            #             )
+            #     except Exception as diag_e:
+            #         logger.info("DIAG get_finished error: %s", diag_e)
 
             if self.use_host_buffer:
                 self.sync_recved_kv_to_device(req_id, meta)
@@ -3335,18 +3331,18 @@ class NixlConnectorWorker:
                 all_msgs.append((notif.decode("utf-8"), now))
 
         for msg, buffered_ts in all_msgs:
-            logger.info("Push notif recv: %s", msg)
+            # logger.info("Push notif recv: %s", msg)
             # Per-layer push notifications: L:<proxy_req_id>:<layer_idx>:<tp_size>
             if msg.startswith("L:"):
                 _, proxy_req_id, layer_s, _tp = msg.split(":", 3)
                 local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
                 if local_req_id is None:
-                    logger.info(
-                        "Push L: buffering (no mapping yet) "
-                        "proxy_id=%s layer=%s",
-                        proxy_req_id,
-                        layer_s,
-                    )
+                    # logger.info(
+                    #     "Push L: buffering (no mapping yet) "
+                    #     "proxy_id=%s layer=%s",
+                    #     proxy_req_id,
+                    #     layer_s,
+                    # )
                     self._push_notif_buffer.append((msg, buffered_ts))
                     continue
                 pending = self._push_recv_layer_pending.get(local_req_id)
@@ -3380,10 +3376,10 @@ class NixlConnectorWorker:
                 _, proxy_req_id, _tp = msg.split(":", 2)
                 local_req_id = self._push_proxy_to_local_req.get(proxy_req_id)
                 if local_req_id is None:
-                    logger.info(
-                        "Push D: buffering (no mapping yet) proxy_id=%s",
-                        proxy_req_id,
-                    )
+                    # logger.info(
+                    #     "Push D: buffering (no mapping yet) proxy_id=%s",
+                    #     proxy_req_id,
+                    # )
                     self._push_notif_buffer.append((msg, buffered_ts))
                     continue
                 self._push_recv_reqs.discard(local_req_id)
