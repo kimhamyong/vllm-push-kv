@@ -2872,6 +2872,12 @@ class NixlConnectorWorker:
             )
             return
 
+        # Ensure the attention CUDA kernel has completed writing KV data
+        # to GPU memory before NIXL reads it via RDMA.  Without this
+        # barrier the WRITE may transfer stale/uninitialised data because
+        # RDMA bypasses the CUDA stream.
+        torch.cuda.current_stream().synchronize()
+
         if self._is_all_layers_mode:
             # ALL_LAYERS: single KV tensor for all model layers.
             # Only issue bulk WRITE at the last model layer.
