@@ -208,7 +208,7 @@ async def _handle_completions(api: str, request: Request):
         # Gives decode time to alloc blocks + send ZMQ block_info,
         # so prefill's save_kv_layer() finds block_info ready (no pending).
         prefill_delay_s = float(os.environ.get(
-            "PUSH_PREFILL_DELAY_MS", "5")) / 1000.0
+            "PUSH_PREFILL_DELAY_MS", "20")) / 1000.0
 
         async def _delayed_prefill():
             """Send prefill request after a short delay."""

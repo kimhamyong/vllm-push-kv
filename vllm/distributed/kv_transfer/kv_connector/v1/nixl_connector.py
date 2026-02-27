@@ -602,6 +602,10 @@ class NixlConnectorScheduler:
         self._encoded_xfer_handshake_metadata: dict[int, Any] = {}
         self._stop_event = threading.Event()
 
+        # Persistent ZMQ sockets for push block_info (keyed by endpoint).
+        # Avoids per-request socket creation/teardown overhead.
+        self._push_zmq_sockets: dict[str, tuple[zmq.Context, zmq.Socket]] = {}
+
         # Requests that need to start recv/send.
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
@@ -618,6 +622,25 @@ class NixlConnectorScheduler:
         # remote prefill or aborted.
         self._reqs_not_processed: set[ReqId] = set()
 
+    def _get_push_zmq_socket(self, path: str) -> zmq.Socket:
+        """Get or create a persistent ZMQ REQ socket for the given endpoint."""
+        entry = self._push_zmq_sockets.get(path)
+        if entry is not None:
+            return entry[1]
+        ctx = zmq.Context()
+        sock = make_zmq_socket(
+            ctx=ctx, path=path, socket_type=zmq.REQ, bind=False)
+        sock.setsockopt(zmq.RCVTIMEO, 5000)
+        sock.setsockopt(zmq.SNDTIMEO, 5000)
+        # REQ_RELAXED: allow sending a new request without receiving
+        # the previous reply, preventing socket state corruption on
+        # timeout.
+        sock.setsockopt(zmq.REQ_RELAXED, 1)
+        sock.setsockopt(zmq.REQ_CORRELATE, 1)
+        self._push_zmq_sockets[path] = (ctx, sock)
+        logger.info("Created persistent ZMQ socket to %s", path)
+        return sock
+
     def _send_push_block_info(
         self,
         prefill_host: str,
@@ -628,6 +651,7 @@ class NixlConnectorScheduler:
 
         Called immediately from update_state_after_alloc() to minimize
         latency (no need to wait for metadata→Worker pipeline).
+        Uses persistent sockets to avoid per-request connection overhead.
         """
         # Target each Prefill TP rank's push listener
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
@@ -641,30 +665,44 @@ class NixlConnectorScheduler:
                 path,
                 block_info["request_id"],
             )
-            with zmq_ctx(zmq.REQ, path) as sock:
-                sock.setsockopt(zmq.RCVTIMEO, 5000)
-                msg = msgspec.msgpack.encode(
-                    (PUSH_BLOCK_INFO_MSG, block_info)
-                )
+            sock = self._get_push_zmq_socket(path)
+            msg = msgspec.msgpack.encode(
+                (PUSH_BLOCK_INFO_MSG, block_info)
+            )
+            try:
                 sock.send(msg)
-                try:
-                    reply = sock.recv()
-                    if reply != b"OK":
-                        logger.warning(
-                            "Push block info send got non-OK reply: %s",
-                            reply,
-                        )
-                except zmq.Again:
-                    logger.error(
-                        "Push block info send timed out for req=%s",
-                        block_info["request_id"],
+                reply = sock.recv()
+                if reply != b"OK":
+                    logger.warning(
+                        "Push block info send got non-OK reply: %s",
+                        reply,
                     )
+            except zmq.Again:
+                logger.error(
+                    "Push block info send timed out for req=%s",
+                    block_info["request_id"],
+                )
+            except zmq.ZMQError as e:
+                logger.error(
+                    "Push block info ZMQ error for req=%s: %s",
+                    block_info["request_id"], e,
+                )
+                # Destroy broken socket; next call recreates it.
+                old = self._push_zmq_sockets.pop(path, None)
+                if old is not None:
+                    old[1].close(linger=0)
+                    old[0].destroy(linger=0)
 
     def shutdown(self):
         self._stop_event.set()
         if self._nixl_handshake_listener_t is not None:
             self._nixl_handshake_listener_t.join()
             self._nixl_handshake_listener_t = None
+        # Clean up persistent ZMQ sockets.
+        for path, (ctx, sock) in self._push_zmq_sockets.items():
+            sock.close(linger=0)
+            ctx.destroy(linger=0)
+        self._push_zmq_sockets.clear()
 
     def set_xfer_handshake_metadata(
         self, metadata: dict[int, KVConnectorHandshakeMetadata]
