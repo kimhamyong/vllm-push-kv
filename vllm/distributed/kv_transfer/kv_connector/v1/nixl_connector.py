@@ -1259,6 +1259,10 @@ class NixlConnectorWorker:
         # Track requests where all layers have been submitted for WRITE.
         # _poll_push_layer_completions only sends D: when req is in this set.
         self._push_all_layers_submitted: set[ReqId] = set()
+        # Deferred WRITE: layer index whose WRITE is postponed to the
+        # next save_kv_layer() call so the attention kernel is guaranteed
+        # complete without an explicit CUDA stream synchronize().
+        self._deferred_push_layer_idx: int | None = None
         # Async ACK (default): return at SENT state, flush in background.
         # Set VLLM_PUSH_SYNC_ACK=1 to block until DONE (TCP ACK).
         self._push_async_ack = os.environ.get(
@@ -2862,6 +2866,28 @@ class NixlConnectorWorker:
         if self._pending_push_reqs:
             self._resolve_pending_pushes(layer_idx)
 
+        # Flush deferred WRITE from the previous layer.  By the time
+        # we enter save_kv_layer(N), layer N-1's attention kernel has
+        # already completed on the same CUDA stream, so the WRITE reads
+        # valid KV data without an explicit synchronize().
+        if self._deferred_push_layer_idx is not None and self._push_targets:
+            deferred = self._deferred_push_layer_idx
+            self._deferred_push_layer_idx = None
+            is_last = deferred == self.num_layers - 1
+            logger.debug(
+                "save_kv_layer FLUSH deferred layer=%d at layer=%d",
+                deferred, layer_idx,
+            )
+            for req_id, target in self._push_targets.items():
+                self._write_push_for_layer(
+                    req_id,
+                    target,
+                    write_layer_idx=deferred,
+                    layer_idx=deferred,
+                    is_last_layer=is_last,
+                )
+            self._poll_push_layer_completions()
+
         if not self._push_targets:
             # Still poll existing per-layer handles from prior iterations
             # (handles from earlier requests may have completed).
@@ -2872,12 +2898,6 @@ class NixlConnectorWorker:
             )
             return
 
-        # Ensure the attention CUDA kernel has completed writing KV data
-        # to GPU memory before NIXL reads it via RDMA.  Without this
-        # barrier the WRITE may transfer stale/uninitialised data because
-        # RDMA bypasses the CUDA stream.
-        torch.cuda.current_stream().synchronize()
-
         if self._is_all_layers_mode:
             # ALL_LAYERS: single KV tensor for all model layers.
             # Only issue bulk WRITE at the last model layer.
@@ -2886,6 +2906,9 @@ class NixlConnectorWorker:
             )
             if not is_last_model_layer:
                 return
+            # ALL_LAYERS bulk WRITE needs sync since all layers are
+            # written at the last model layer boundary.
+            torch.cuda.current_stream().synchronize()
             for req_id, target in self._push_targets.items():
                 self._write_push_for_layer(
                     req_id,
@@ -2895,23 +2918,32 @@ class NixlConnectorWorker:
                     is_last_layer=True,
                 )
         else:
-            # Per-layer mode: WRITE each layer individually.
+            # Per-layer mode: defer current layer's WRITE to the next
+            # save_kv_layer() call where the kernel is guaranteed done.
             is_last_layer = layer_idx == self.num_layers - 1
-            logger.debug(
-                "save_kv_layer WRITE layer=%d/%d targets=%d",
-                layer_idx, self.num_layers - 1,
-                len(self._push_targets),
-            )
-            for req_id, target in self._push_targets.items():
-                self._write_push_for_layer(
-                    req_id,
-                    target,
-                    write_layer_idx=layer_idx,
-                    layer_idx=layer_idx,
-                    is_last_layer=is_last_layer,
+            if is_last_layer:
+                # Last layer: must sync and WRITE immediately since
+                # there is no subsequent save_kv_layer() call to flush.
+                torch.cuda.current_stream().synchronize()
+                for req_id, target in self._push_targets.items():
+                    self._write_push_for_layer(
+                        req_id,
+                        target,
+                        write_layer_idx=layer_idx,
+                        layer_idx=layer_idx,
+                        is_last_layer=True,
+                    )
+                self._poll_push_layer_completions()
+            else:
+                # Defer: WRITE will be flushed at the start of the
+                # next save_kv_layer() call (kernel guaranteed done).
+                self._deferred_push_layer_idx = layer_idx
+                logger.debug(
+                    "save_kv_layer DEFER layer=%d/%d targets=%d",
+                    layer_idx, self.num_layers - 1,
+                    len(self._push_targets),
                 )
-            # Poll for completed per-layer WRITEs and send L: notifications.
-            self._poll_push_layer_completions()
+                self._poll_push_layer_completions()
 
     def wait_for_push_recv(self) -> None:
         """Block until all push recv requests have received notification.
@@ -2993,6 +3025,25 @@ class NixlConnectorWorker:
         arrived after forward completed), wait for resolution then
         issue bulk WRITE for all layers.
         """
+        # Flush any deferred WRITE from the last layer before the
+        # forward pass completed.  At this point ALL CUDA kernels
+        # have finished, so the data is safe to read.
+        if self._deferred_push_layer_idx is not None and self._push_targets:
+            deferred = self._deferred_push_layer_idx
+            self._deferred_push_layer_idx = None
+            is_last = deferred == self.num_layers - 1
+            logger.debug(
+                "wait_for_push_complete: flush deferred layer=%d", deferred)
+            for req_id, target in self._push_targets.items():
+                self._write_push_for_layer(
+                    req_id,
+                    target,
+                    write_layer_idx=deferred,
+                    layer_idx=deferred,
+                    is_last_layer=is_last,
+                )
+            self._poll_push_layer_completions()
+
         # Fallback: resolve any pending push reqs whose block info
         # arrived after forward completed
         if self._pending_push_reqs:
