@@ -20,18 +20,36 @@ RESULTS_DIR="/home/ubuntu/vllm/results/${SCRIPT_NAME}"
 RESULT_FILE="${RESULTS_DIR}/${SCRIPT_NAME}_${TIMESTAMP}.json"
 NUM_PROMPTS=${NUM_PROMPTS:-10}
 OUTPUT_LEN=${OUTPUT_LEN:-200}
-SEQ_PROMPT_FILE=${SEQ_PROMPT_FILE:-/home/ubuntu/vllm/disagg_prompts/seq_96k.txt}
-CONC_PROMPT_FILE=${CONC_PROMPT_FILE:-/home/ubuntu/vllm/disagg_prompts/conc_48k.txt}
-SEQ_PROMPT_FILE_XL=${SEQ_PROMPT_FILE_XL:-/home/ubuntu/vllm/disagg_prompts/seq_128k.txt}
-CONC_PROMPT_FILE_XL=${CONC_PROMPT_FILE_XL:-/home/ubuntu/vllm/disagg_prompts/conc_64k.txt}
-USE_XL_PROMPTS=${USE_XL_PROMPTS:-0}
+# PROMPT_SET lets us switch between the large prompt bundles (set only when needed).
+PROMPT_SET=${PROMPT_SET:-}
 PROMPT_TOKEN_CHECK=${PROMPT_TOKEN_CHECK:-0}
-MODEL_MAX_LEN=${MODEL_MAX_LEN:-24576}
+MODEL_MAX_LEN=${MODEL_MAX_LEN:-131072}
 
-if [ "$USE_XL_PROMPTS" = "1" ]; then
-    SEQ_PROMPT_FILE="$SEQ_PROMPT_FILE_XL"
-    CONC_PROMPT_FILE="$CONC_PROMPT_FILE_XL"
-fi
+# Default prompt set is the short ~800 token accuracy prompt bundle (10 requests).
+SEQ_PROMPT_FILE_DEFAULT="/home/ubuntu/vllm/disagg_prompts/seq_800.txt"
+CONC_PROMPT_FILE_DEFAULT="/home/ubuntu/vllm/disagg_prompts/conc_800.txt"
+PROMPT_SET_LABEL="base_800"
+
+case "$PROMPT_SET" in
+    0)
+        SEQ_PROMPT_FILE_DEFAULT="/home/ubuntu/vllm/disagg_prompts/seq_48k.txt"
+        CONC_PROMPT_FILE_DEFAULT="/home/ubuntu/vllm/disagg_prompts/conc_24k.txt"
+        PROMPT_SET_LABEL="0(48k/24k)"
+        ;;
+    1)
+        SEQ_PROMPT_FILE_DEFAULT="/home/ubuntu/vllm/disagg_prompts/seq_24k.txt"
+        CONC_PROMPT_FILE_DEFAULT="/home/ubuntu/vllm/disagg_prompts/conc_12k.txt"
+        PROMPT_SET_LABEL="1(24k/12k)"
+        ;;
+    2)
+        SEQ_PROMPT_FILE_DEFAULT="/home/ubuntu/vllm/disagg_prompts/seq_18k.txt"
+        CONC_PROMPT_FILE_DEFAULT="/home/ubuntu/vllm/disagg_prompts/conc_9k.txt"
+        PROMPT_SET_LABEL="2(18k/9k)"
+        ;;
+esac
+
+SEQ_PROMPT_FILE=${SEQ_PROMPT_FILE:-$SEQ_PROMPT_FILE_DEFAULT}
+CONC_PROMPT_FILE=${CONC_PROMPT_FILE:-$CONC_PROMPT_FILE_DEFAULT}
 
 # Create results directory
 mkdir -p "$RESULTS_DIR"
@@ -39,15 +57,18 @@ mkdir -p "$RESULTS_DIR"
 # Export variables for Python
 export MODEL_NAME PROXY_URL PREFILL_URL DECODE_URL
 export NUM_PROMPTS OUTPUT_LEN RESULT_FILE TIMESTAMP SEQ_PROMPT_FILE CONC_PROMPT_FILE
-export PROMPT_TOKEN_CHECK MODEL_MAX_LEN
-export SEQ_PROMPT_FILE_XL CONC_PROMPT_FILE_XL USE_XL_PROMPTS
+export PROMPT_TOKEN_CHECK MODEL_MAX_LEN PROMPT_SET
 
 echo "=============================================="
 echo "Disaggregated Prefill Benchmark"
 echo "=============================================="
 echo "Model: $MODEL_NAME"
 echo "Proxy URL: $PROXY_URL"
-echo "Prompt Files: seq=$SEQ_PROMPT_FILE conc=$CONC_PROMPT_FILE (USE_XL_PROMPTS=$USE_XL_PROMPTS)"
+if [ -n "$PROMPT_SET" ]; then
+    echo "Prompt Files: seq=$SEQ_PROMPT_FILE conc=$CONC_PROMPT_FILE (PROMPT_SET=$PROMPT_SET_LABEL)"
+else
+    echo "Prompt Files: seq=$SEQ_PROMPT_FILE conc=$CONC_PROMPT_FILE (PROMPT_SET=$PROMPT_SET_LABEL)"
+fi
 echo "Result File: $RESULT_FILE"
 echo "=============================================="
 
