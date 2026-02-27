@@ -119,7 +119,7 @@ if [ "${NSYS_PROFILE}" = "1" ] && command -v nsys &> /dev/null; then
         ${VLLM_BIN} serve ${MODEL_NAME} \
             --host 0.0.0.0 \
             --port 8100 \
-            --max-model-len 24576 \
+            --max-model-len 131072 \
             --gpu-memory-utilization 0.8 \
             --trust-remote-code \
             --enforce-eager \
@@ -180,7 +180,7 @@ export UCX_TCP_PORT_RANGE=40000-40009
 nohup /home/ubuntu/vllm/.venv/bin/vllm serve meta-llama/Llama-3.2-1B \
     --host 0.0.0.0 \
     --port 8200 \
-    --max-model-len 24576 \
+    --max-model-len 131072 \
     --gpu-memory-utilization 0.8 \
     --trust-remote-code \
     --enforce-eager \
@@ -258,7 +258,7 @@ export UCX_TCP_PORT_RANGE=40000-40009
 nohup /home/ubuntu/vllm/.venv/bin/vllm serve meta-llama/Llama-3.2-1B \
     --host 0.0.0.0 \
     --port 8200 \
-            --max-model-len 24576 \
+            --max-model-len 131072 \
     --gpu-memory-utilization 0.8 \
     --trust-remote-code \
     --enforce-eager \
@@ -282,7 +282,7 @@ DECODE_NORMAL_SSH
     ${VLLM_BIN} serve ${MODEL_NAME} \
         --host 0.0.0.0 \
         --port 8100 \
-    --max-model-len 24576 \
+    --max-model-len 131072 \
         --gpu-memory-utilization 0.8 \
         --trust-remote-code \
         --enforce-eager \
